@@ -1,0 +1,26 @@
+{
+  "name": "webrtc-signaling-server",
+  "version": "1.0.0",
+  "description": "Minimal, zero-retention WebRTC signaling WebSocket server with 6-character room codes and instant peer teardown",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js && node test-chunker.js && node test-crypto.js && node test-webrtc-backpressure.js",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "keywords": [
+    "webrtc",
+    "signaling",
+    "websocket",
+    "ws",
+    "p2p"
+  ],
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "prettier": "^3.9.6"
+  }
+}
