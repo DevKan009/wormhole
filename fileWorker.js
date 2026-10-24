@@ -4,35 +4,11 @@
  * Web Worker for reading files in strict 64 KB chunks, sequentially encrypting each chunk
  * with AES-GCM (256-bit) using a deterministic 96-bit counter nonce, and streaming
  * the encrypted chunks via Transferable Objects with pause/resume flow control.
+ *
+ * Browser-only: it is loaded with `new Worker('/fileWorker.js')`. A failure to load the shared
+ * scripts is deliberately fatal so it shows up as a worker error instead of a silent no-op.
  */
-
-// If running in a browser Web Worker, import dependencies
-if (typeof importScripts === 'function') {
-  try {
-    if (typeof FlowController === 'undefined') importScripts('./fileChunker.js');
-    if (typeof encryptChunk === 'undefined') importScripts('./chunkCrypto.js');
-  } catch {}
-}
-
-// Module imports for Node.js worker_threads / testing environments
-const { FlowController, readFileChunksDetailed, CHUNK_SIZE } =
-  typeof module !== 'undefined' && typeof require === 'function'
-    ? require('./fileChunker')
-    : {
-        FlowController: self.FlowController,
-        readFileChunksDetailed: self.readFileChunksDetailed,
-        CHUNK_SIZE: self.CHUNK_SIZE || 65536
-      };
-
-const { generateAESKey, importRawKey, exportRawKey, encryptChunk } =
-  typeof module !== 'undefined' && typeof require === 'function'
-    ? require('./chunkCrypto')
-    : {
-        generateAESKey: self.generateAESKey,
-        importRawKey: self.importRawKey,
-        exportRawKey: self.exportRawKey,
-        encryptChunk: self.encryptChunk
-      };
+importScripts('./fileChunker.js', './chunkCrypto.js');
 
 let currentController = null;
 let isProcessing = false;
@@ -59,7 +35,9 @@ self.onmessage = async function (e) {
         currentController.abort(new Error('Previous operation cancelled by new read request'));
       }
 
-      currentController = new FlowController();
+      const fileIndex = Number.isInteger(data.fileIndex) ? data.fileIndex : 0;
+      const controller = new FlowController();
+      currentController = controller;
       isProcessing = true;
 
       try {
@@ -94,13 +72,12 @@ self.onmessage = async function (e) {
         });
 
         // Sequentially read and encrypt each chunk in strict 64 KB slices
-        for await (const chunkInfo of readFileChunksDetailed(file, {
-          controller: currentController
-        })) {
+        for await (const chunkInfo of readFileChunksDetailed(file, { controller })) {
           const { chunk, index, offset, isLast } = chunkInfo;
 
-          // Encrypt with 96-bit deterministic counter nonce (starting at 0)
-          const encryptedChunk = await encryptChunk(cryptoKey, chunk, index);
+          // Encrypt with a 96-bit deterministic counter nonce: file index (high bits) and chunk
+          // index (low bits), so each file in a session has its own nonce range
+          const encryptedChunk = await encryptChunk(cryptoKey, chunk, nonceIndex(fileIndex, index));
 
           // Export encrypted ArrayBuffer with chunkIndex via zero-copy Transferable
           self.postMessage(
@@ -119,14 +96,17 @@ self.onmessage = async function (e) {
 
         self.postMessage({ type: 'COMPLETE', totalChunks, fileSize: file.size });
       } catch (err) {
-        if (currentController && currentController.isAborted) {
+        if (controller.isAborted) {
           self.postMessage({ type: 'ABORTED', reason: err.message });
         } else {
           self.postMessage({ type: 'ERROR', error: err.message || 'Error during file encryption' });
         }
       } finally {
-        isProcessing = false;
-        currentController = null;
+        // Only clear shared state if a newer START has not replaced this run's controller
+        if (currentController === controller) {
+          isProcessing = false;
+          currentController = null;
+        }
       }
       break;
     }

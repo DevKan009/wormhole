@@ -1,6 +1,7 @@
 'use strict';
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -10,7 +11,47 @@ const { WebSocketServer, WebSocket } = require('ws');
 const DEFAULT_PORT = parseInt(process.env.PORT, 10) || 8080;
 const ROOM_CODE_LENGTH = 6;
 const ROOM_CODE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+const ROOM_CODE_PATTERN = /^[A-Z0-9]{6}$/;
 const HEARTBEAT_INTERVAL_MS = 30000;
+// SDP offers/answers are a few KB; anything near this size is not signaling traffic
+const MAX_SIGNALING_PAYLOAD_BYTES = 64 * 1024;
+const MAX_ROOMS = parseInt(process.env.MAX_ROOMS, 10) || 10000;
+
+const PUBLIC_DIR = path.join(__dirname, 'public');
+
+// Browser scripts that live next to server.js because Node tests also require() them.
+// Only these exact files are served from the project root; nothing else outside public/ is reachable.
+const ROOT_SCRIPTS = new Set([
+  'fileWorker.js',
+  'fileChunker.js',
+  'chunkCrypto.js',
+  'webrtcSender.js',
+  'webrtcReceiver.js'
+]);
+
+const DEFAULT_STUN_URLS = [
+  'stun:stun.l.google.com:19302',
+  'stun:stun1.l.google.com:19302',
+  'stun:global.stun.twilio.com:3478'
+];
+
+const SECURITY_HEADERS = {
+  'Content-Security-Policy': [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self' data: blob:",
+    "connect-src 'self' ws: wss:",
+    "worker-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'"
+  ].join('; '),
+  'Referrer-Policy': 'no-referrer',
+  'X-Content-Type-Options': 'nosniff',
+  'Cache-Control': 'no-store'
+};
 
 // Allowed signaling message types for direct 2-peer pass-through
 const SIGNALING_TYPES = new Set(['offer', 'answer', 'ice-candidate', 'candidate', 'ice_candidate']);
@@ -59,50 +100,129 @@ function sendJSON(ws, message) {
 }
 
 /**
- * Serves static files from public/ and workspace root for workers/modules.
+ * Builds the ICE server list handed to browsers.
+ *
+ * Environment:
+ *   STUN_URLS      comma-separated STUN URLs (default: public STUN servers)
+ *   TURN_URL       comma-separated TURN URLs, e.g. "turn:turn.example.com:3478,turns:turn.example.com:5349"
+ *   TURN_SECRET    coturn `static-auth-secret`: issues short-lived credentials per request (HMAC-SHA1)
+ *   TURN_TTL       lifetime in seconds of those credentials (default 3600)
+ *   TURN_USERNAME / TURN_CREDENTIAL   static long-term credentials, used when TURN_SECRET is unset
+ *
+ * @param {object} [env]
+ * @param {number} [nowMs]
+ * @returns {{ iceServers: object[] }}
+ */
+function buildIceConfig(env = process.env, nowMs = Date.now()) {
+  const list = (value) =>
+    (value || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+  const stunUrls = list(env.STUN_URLS);
+  const iceServers = [{ urls: stunUrls.length > 0 ? stunUrls : DEFAULT_STUN_URLS }];
+
+  const turnUrls = list(env.TURN_URL);
+  if (turnUrls.length > 0) {
+    if (env.TURN_SECRET) {
+      const ttl = parseInt(env.TURN_TTL, 10) || 3600;
+      const username = String(Math.floor(nowMs / 1000) + ttl);
+      const credential = crypto
+        .createHmac('sha1', env.TURN_SECRET)
+        .update(username)
+        .digest('base64');
+      iceServers.push({ urls: turnUrls, username, credential });
+    } else if (env.TURN_USERNAME && env.TURN_CREDENTIAL) {
+      iceServers.push({
+        urls: turnUrls,
+        username: env.TURN_USERNAME,
+        credential: env.TURN_CREDENTIAL
+      });
+    }
+  }
+
+  return { iceServers };
+}
+
+/**
+ * Resolves a request pathname to a servable file, or null.
+ * Only public/ (with a containment check) and the ROOT_SCRIPTS allowlist are reachable.
+ * @param {string} pathname URL pathname (still percent-encoded)
+ * @returns {string|null} absolute file path
+ */
+function resolveStaticFile(pathname) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  if (decoded.includes('\0') || decoded.includes('\\')) {
+    return null;
+  }
+  if (decoded === '/') {
+    decoded = '/index.html';
+  }
+
+  const name = decoded.slice(1);
+  if (ROOT_SCRIPTS.has(name)) {
+    return path.join(__dirname, name);
+  }
+
+  const target = path.resolve(PUBLIC_DIR, '.' + decoded);
+  if (target !== PUBLIC_DIR && !target.startsWith(PUBLIC_DIR + path.sep)) {
+    return null;
+  }
+  try {
+    return fs.statSync(target).isFile() ? target : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Serves the web app, /health and /ice-config. Nothing here touches signaling or payload data.
  */
 function handleHttpRequest(req, res, rooms) {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
-    res.writeHead(405, { 'Content-Type': 'text/plain' });
+    res.writeHead(405, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' });
     res.end('Method Not Allowed');
     return;
   }
 
   // Parse requested pathname
   const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  let pathname = parsedUrl.pathname;
+  const pathname = parsedUrl.pathname;
 
   if (pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', activeRooms: rooms.size }));
     return;
   }
 
-  if (pathname === '/') {
-    pathname = '/index.html';
-  }
-
-  // Prevent directory traversal
-  const safePath = path.normalize(pathname).replace(/^(\.\.[\/\\])+/, '');
-
-  // Try public/ first, then workspace root
-  let targetFile = path.join(__dirname, 'public', safePath);
-  if (!fs.existsSync(targetFile)) {
-    targetFile = path.join(__dirname, safePath);
-  }
-
-  if (fs.existsSync(targetFile) && fs.statSync(targetFile).isFile()) {
-    const ext = path.extname(targetFile).toLowerCase();
-    const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-    res.writeHead(200, {
-      'Content-Type': contentType,
-      'Cache-Control': 'no-cache'
-    });
-    fs.createReadStream(targetFile).pipe(res);
+  if (pathname === '/ice-config') {
+    res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(buildIceConfig()));
     return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  const targetFile = resolveStaticFile(pathname);
+  if (targetFile) {
+    const ext = path.extname(targetFile).toLowerCase();
+    const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+    res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': contentType });
+    if (req.method === 'HEAD') {
+      res.end();
+      return;
+    }
+    fs.createReadStream(targetFile)
+      .on('error', () => res.destroy())
+      .pipe(res);
+    return;
+  }
+
+  res.writeHead(404, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' });
   res.end('404 Not Found');
 }
 
@@ -110,21 +230,27 @@ function handleHttpRequest(req, res, rooms) {
  * Creates and initializes the WebRTC Signaling Server and HTTP Static Host.
  * @param {object} [options]
  * @param {http.Server} [options.server] Optional existing HTTP server
+ * @param {{ key: string|Buffer, cert: string|Buffer }} [options.tls] Serve HTTPS/WSS with this key pair
  * @param {number} [options.port] Optional port
  * @param {number} [options.heartbeatInterval] Heartbeat interval in ms
+ * @param {number} [options.maxRooms] Cap on simultaneous rooms
  * @returns {{ server: http.Server, wss: WebSocketServer, rooms: Map<string, Set<WebSocket>>, close: Function }}
  */
 function createSignalingServer(options = {}) {
   // Ephemeral room registry: roomCode -> Set<WebSocket> (max 2 peers)
   const rooms = new Map();
+  const maxRooms = options.maxRooms || MAX_ROOMS;
 
+  const requestHandler = (req, res) => {
+    handleHttpRequest(req, res, rooms);
+  };
   const server =
     options.server ||
-    http.createServer((req, res) => {
-      handleHttpRequest(req, res, rooms);
-    });
+    (options.tls
+      ? https.createServer(options.tls, requestHandler)
+      : http.createServer(requestHandler));
 
-  const wss = new WebSocketServer({ server });
+  const wss = new WebSocketServer({ server, maxPayload: MAX_SIGNALING_PAYLOAD_BYTES });
 
   /**
    * Instantly cleans up room and disconnects partner peer if one side disconnects.
@@ -191,6 +317,11 @@ function createSignalingServer(options = {}) {
           return;
         }
 
+        if (rooms.size >= maxRooms) {
+          sendJSON(ws, { type: 'error', message: 'Server is busy, try again later' });
+          return;
+        }
+
         const roomCode = generateRoomCode(rooms);
         const room = new Set([ws]);
         rooms.set(roomCode, room);
@@ -211,7 +342,7 @@ function createSignalingServer(options = {}) {
           .toString()
           .trim()
           .toUpperCase();
-        if (!requestedCode || requestedCode.length !== ROOM_CODE_LENGTH) {
+        if (!ROOM_CODE_PATTERN.test(requestedCode)) {
           sendJSON(ws, { type: 'error', message: 'Invalid 6-character room code format' });
           return;
         }
@@ -324,9 +455,21 @@ function createSignalingServer(options = {}) {
 
 // Start standalone server when executed directly
 if (require.main === module) {
-  const { server } = createSignalingServer();
+  // Browsers only expose WebCrypto on HTTPS or localhost. For any other host, serve TLS directly
+  // (HTTPS_KEY / HTTPS_CERT: paths to PEM files) or put a TLS-terminating proxy in front.
+  let tls;
+  if (process.env.HTTPS_KEY && process.env.HTTPS_CERT) {
+    tls = {
+      key: fs.readFileSync(process.env.HTTPS_KEY),
+      cert: fs.readFileSync(process.env.HTTPS_CERT)
+    };
+  }
+  const { server } = createSignalingServer({ tls });
   server.listen(DEFAULT_PORT, () => {
-    console.log(`[WebRTC Signaling Server & Web App] Running at http://localhost:${DEFAULT_PORT}`);
+    const scheme = tls ? 'https' : 'http';
+    console.log(
+      `[WebRTC Signaling Server & Web App] Running at ${scheme}://localhost:${DEFAULT_PORT}`
+    );
   });
 
   const shutdown = () => {
@@ -342,6 +485,8 @@ if (require.main === module) {
 
 module.exports = {
   createSignalingServer,
+  buildIceConfig,
+  resolveStaticFile,
   generateRoomCode,
   ROOM_CODE_LENGTH,
   ROOM_CODE_CHARS,

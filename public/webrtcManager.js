@@ -2,11 +2,15 @@
 
 /**
  * WebRTC P2P Client Connection & File Transfer Manager
- * Coordinates Signaling WebSocket, STUN ICE Negotiation, DataChannel Framing,
- * Off-Thread Web Worker Chunk Encryption, and E2EE Decryption.
+ * Coordinates Signaling WebSocket, ICE negotiation, DataChannel framing,
+ * off-thread Web Worker chunk encryption, and E2EE decryption.
+ *
+ * Key handling: the sender generates the AES-GCM key locally and puts it only in the share link's
+ * URL fragment (#ROOM.KEY). Browsers never send fragments to a server, and the key is never sent
+ * over signaling or the data channel.
  */
 
-const RTC_CONFIG = {
+const DEFAULT_RTC_CONFIG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
@@ -14,25 +18,83 @@ const RTC_CONFIG = {
   ]
 };
 
-// Convert ArrayBuffer to Hex String
-function bufToHex(buffer) {
-  return Array.from(new Uint8Array(buffer))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+const RAW_CHUNK_SIZE = 65536;
+const MAX_FILE_NAME_LENGTH = 200;
+const MAX_FILES_PER_SESSION = 1000;
+
+/**
+ * Turns an untrusted remote file name into a safe download name.
+ * @param {unknown} name
+ * @returns {string}
+ */
+function sanitizeFileName(name) {
+  let clean = typeof name === 'string' ? name : '';
+  // Drop any path component and control characters
+  clean = clean.split(/[\\/]/).pop();
+  clean = clean.replace(/[\u0000-\u001f\u007f<>:"|?*]/g, '_').trim();
+  clean = clean.replace(/^\.+/, '');
+  if (clean.length > MAX_FILE_NAME_LENGTH) {
+    const dot = clean.lastIndexOf('.');
+    const ext = dot > 0 && clean.length - dot <= 16 ? clean.slice(dot) : '';
+    clean = clean.slice(0, MAX_FILE_NAME_LENGTH - ext.length) + ext;
+  }
+  return clean || 'downloaded-file';
 }
 
-// Convert Hex String to Uint8Array
-function hexToBuf(hex) {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+/**
+ * Validates the decrypted (but still untrusted) file header.
+ * @param {any} header
+ * @param {{ fileIndex?: number, fileCount?: number|null, totalBytes?: number|null }} [expected]
+ *   What the session already established: the position this header must have, and the batch
+ *   shape announced by the first header (later headers must repeat it).
+ * @returns {{ fileName: string, fileSize: number, fileType: string, totalChunks: number,
+ *   fileIndex: number, fileCount: number, totalBytes: number }}
+ */
+function validateFileHeader(header, expected = {}) {
+  if (!header || typeof header !== 'object') {
+    throw new Error('Malformed file header');
   }
-  return bytes.buffer;
+  const { fileSize, totalChunks, fileIndex, fileCount, totalBytes } = header;
+  if (!Number.isSafeInteger(fileSize) || fileSize < 0) {
+    throw new Error('Malformed file header: invalid size');
+  }
+  if (totalChunks !== (Math.ceil(fileSize / RAW_CHUNK_SIZE) || 1)) {
+    throw new Error('Malformed file header: chunk count does not match size');
+  }
+  if (fileIndex !== (expected.fileIndex ?? 0)) {
+    throw new Error('Malformed file header: file is out of order');
+  }
+  if (!Number.isInteger(fileCount) || fileCount < 1 || fileCount > MAX_FILES_PER_SESSION) {
+    throw new Error('Malformed file header: invalid file count');
+  }
+  if (expected.fileCount != null && fileCount !== expected.fileCount) {
+    throw new Error('Malformed file header: file count changed mid-session');
+  }
+  if (!Number.isSafeInteger(totalBytes) || totalBytes < fileSize) {
+    throw new Error('Malformed file header: invalid batch size');
+  }
+  if (expected.totalBytes != null && totalBytes !== expected.totalBytes) {
+    throw new Error('Malformed file header: batch size changed mid-session');
+  }
+  const fileType =
+    typeof header.fileType === 'string' && header.fileType.length <= 255
+      ? header.fileType
+      : 'application/octet-stream';
+  return {
+    fileName: sanitizeFileName(header.fileName),
+    fileSize,
+    fileType,
+    totalChunks,
+    fileIndex,
+    fileCount,
+    totalBytes
+  };
 }
 
 class WebRTCManager {
   constructor(options = {}) {
     this.wsUrl = options.wsUrl || this._getDefaultWsUrl();
+    this.rtcConfig = options.rtcConfig || null;
     this.ws = null;
     this.pc = null;
     this.dataChannel = null;
@@ -42,6 +104,17 @@ class WebRTCManager {
     this.isInitiator = false;
     this.roomCode = null;
     this.peerConnected = false;
+
+    this.cryptoKey = null; // AES-GCM key for this room (sender generates, receiver reads from link)
+    this.keyBase64Url = null;
+
+    this._signalingQueue = Promise.resolve();
+    this._rxQueue = Promise.resolve();
+    this._pendingCandidates = [];
+    this._finished = false; // transfer finished or deliberately closed, so later closes are not errors
+    this._failed = false;
+    this._sendQueue = null; // sender: { files, index, totalBytes } once sendFiles() has started
+    this._batch = null; // receiver: { fileCount, totalBytes, nextIndex } learnt from the first header
 
     // Callbacks
     this.onStateChange = options.onStateChange || (() => {});
@@ -63,6 +136,34 @@ class WebRTCManager {
   }
 
   /**
+   * Link fragment ("ROOM.KEY", without "#") for the sender to share. Null until a room exists.
+   */
+  getShareFragment() {
+    if (!this.roomCode || !this.keyBase64Url) return null;
+    return buildShareFragment(this.roomCode, this.keyBase64Url);
+  }
+
+  /**
+   * ICE servers come from the server's /ice-config so TURN can be added without a client change.
+   * Falls back to public STUN if the endpoint is unavailable.
+   */
+  async _loadRtcConfig() {
+    if (this.rtcConfig) return;
+    try {
+      const res = await fetch('/ice-config', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const config = await res.json();
+      if (!config || !Array.isArray(config.iceServers) || config.iceServers.length === 0) {
+        throw new Error('empty ICE config');
+      }
+      this.rtcConfig = { iceServers: config.iceServers };
+    } catch (err) {
+      console.warn('Using default STUN configuration:', err);
+      this.rtcConfig = DEFAULT_RTC_CONFIG;
+    }
+  }
+
+  /**
    * Connect to WebSocket Signaling Server
    */
   connectSignaling() {
@@ -72,47 +173,91 @@ class WebRTCManager {
         return;
       }
 
-      this.ws = new WebSocket(this.wsUrl);
+      const ws = new WebSocket(this.wsUrl);
+      this.ws = ws;
+      let opened = false;
 
-      this.ws.onopen = () => {
+      ws.onopen = () => {
+        opened = true;
         this.onStateChange('SIGNALING_CONNECTED');
         resolve();
       };
 
-      this.ws.onerror = (err) => {
-        this.onError('Signaling connection error');
-        reject(err);
+      ws.onerror = (err) => {
+        if (!opened) {
+          this._reportError('Could not reach the signaling server');
+          reject(err);
+        }
       };
 
-      this.ws.onclose = () => {
+      ws.onclose = () => {
+        if (this.ws !== ws) return;
+        this.ws = null;
         this.onStateChange('SIGNALING_DISCONNECTED');
-        this._teardownP2P();
+        // Signaling is only needed to set up the connection. Once the peers are connected (or the
+        // transfer is over) a closed signaling socket is expected: each side leaves the room as soon
+        // as its data channel opens, and the server then drops the other socket. The other side's
+        // channel may not have fired onopen yet, so an ICE state of checking/connected also counts.
+        const ice = this.pc ? this.pc.iceConnectionState : 'none';
+        const negotiated = ice === 'checking' || ice === 'connected' || ice === 'completed';
+        if (!this.peerConnected && !this._finished && !negotiated) {
+          this._teardownP2P();
+          this._reportError('Signaling connection closed before the peer connected');
+          this.onP2PDisconnected();
+        }
       };
 
-      this.ws.onmessage = async (event) => {
+      ws.onmessage = (event) => {
+        let msg;
         try {
-          const msg = JSON.parse(event.data);
-          await this._handleSignalingMessage(msg);
+          msg = JSON.parse(event.data);
         } catch (err) {
           console.error('Failed to parse signaling message:', err);
+          return;
         }
+        // Handle strictly in arrival order: handlers await WebRTC calls, and an ICE candidate must
+        // never be processed before the offer/answer that precedes it.
+        this._signalingQueue = this._signalingQueue
+          .then(() => this._handleSignalingMessage(msg))
+          .catch((err) => {
+            console.error('Signaling handler failed:', err);
+            this._reportError(err.message || 'Signaling error');
+          });
       };
     });
   }
 
   /**
-   * Create a new 6-character room
+   * Create a new 6-character room. The AES key is generated here and never leaves this browser
+   * except inside the share link fragment.
    */
   async createRoom() {
+    this._resetSession();
+    await this._loadRtcConfig();
+    this.cryptoKey = await generateAESKey();
+    this.keyBase64Url = await keyToBase64Url(this.cryptoKey);
     await this.connectSignaling();
     this.isInitiator = true;
     this.ws.send(JSON.stringify({ type: 'create' }));
   }
 
   /**
-   * Join an existing room with 6-character code
+   * Join an existing room. `keyBase64Url` comes from the link fragment.
    */
-  async joinRoom(code) {
+  async joinRoom(code, keyBase64Url) {
+    this._resetSession();
+    if (!keyBase64Url) {
+      this._reportError('This link has no decryption key. Ask the sender for the full share link.');
+      return;
+    }
+    try {
+      this.cryptoKey = await keyFromBase64Url(keyBase64Url);
+    } catch (err) {
+      this._reportError(err.message || 'Invalid encryption key in link');
+      return;
+    }
+    this.keyBase64Url = keyBase64Url;
+    await this._loadRtcConfig();
     await this.connectSignaling();
     this.isInitiator = false;
     const cleanCode = (code || '').trim().toUpperCase();
@@ -155,17 +300,11 @@ class WebRTCManager {
         break;
 
       case 'ice-candidate':
-        if (msg.candidate && this.pc) {
-          try {
-            await this.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-          } catch (e) {
-            console.error('Error adding received ICE candidate:', e);
-          }
-        }
+        await this._handleRemoteCandidate(msg.candidate);
         break;
 
       case 'error':
-        this.onError(msg.message || 'Signaling server error');
+        this._reportError(msg.message || 'Signaling server error');
         break;
     }
   }
@@ -176,9 +315,10 @@ class WebRTCManager {
   _initPeerConnection() {
     if (this.pc) return;
 
-    this.pc = new RTCPeerConnection(RTC_CONFIG);
+    const pc = new RTCPeerConnection(this.rtcConfig || DEFAULT_RTC_CONFIG);
+    this.pc = pc;
 
-    this.pc.onicecandidate = (event) => {
+    pc.addEventListener('icecandidate', (event) => {
       if (event.candidate && this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(
           JSON.stringify({
@@ -187,35 +327,33 @@ class WebRTCManager {
           })
         );
       }
-    };
+    });
 
-    this.pc.oniceconnectionstatechange = () => {
-      const state = this.pc.iceConnectionState;
+    // Listener (not the on-property): WebRTCFileSender watches the same event on the same pc.
+    pc.addEventListener('iceconnectionstatechange', () => {
+      if (this.pc !== pc) return;
+      const state = pc.iceConnectionState;
       this.onStateChange(`ICE_${state.toUpperCase()}`);
       if (state === 'disconnected' || state === 'failed' || state === 'closed') {
-        this._teardownP2P();
-        this.onP2PDisconnected();
+        this._handleConnectionLost(`Peer connection ${state}`);
       }
-    };
+    });
 
     if (this.isInitiator) {
       // Initiator creates data channel
-      this.dataChannel = this.pc.createDataChannel('fileTransfer', {
+      this.dataChannel = pc.createDataChannel('fileTransfer', {
         ordered: true
       });
       this._setupDataChannel(this.dataChannel);
     } else {
       // Receiver waits for data channel from initiator
-      this.pc.ondatachannel = (event) => {
+      pc.ondatachannel = (event) => {
         this.dataChannel = event.channel;
         this._setupDataChannel(this.dataChannel);
       };
     }
   }
 
-  /**
-   * Create WebRTC Offer
-   */
   async _createAndSendOffer() {
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
@@ -227,12 +365,10 @@ class WebRTCManager {
     );
   }
 
-  /**
-   * Handle WebRTC Offer
-   */
   async _handleOffer(msg) {
     if (!this.pc) this._initPeerConnection();
-    await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: msg.sdp }));
+    await this.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+    await this._flushPendingCandidates();
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
     this.ws.send(
@@ -243,11 +379,33 @@ class WebRTCManager {
     );
   }
 
-  /**
-   * Handle WebRTC Answer
-   */
   async _handleAnswer(msg) {
-    await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: msg.sdp }));
+    await this.pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+    await this._flushPendingCandidates();
+  }
+
+  /**
+   * Candidates that arrive before the remote description is set are held back.
+   */
+  async _handleRemoteCandidate(candidate) {
+    if (!candidate) return;
+    if (!this.pc || !this.pc.remoteDescription) {
+      this._pendingCandidates.push(candidate);
+      return;
+    }
+    try {
+      await this.pc.addIceCandidate(candidate);
+    } catch (e) {
+      console.error('Error adding received ICE candidate:', e);
+    }
+  }
+
+  async _flushPendingCandidates() {
+    const pending = this._pendingCandidates;
+    this._pendingCandidates = [];
+    for (const candidate of pending) {
+      await this._handleRemoteCandidate(candidate);
+    }
   }
 
   /**
@@ -259,145 +417,277 @@ class WebRTCManager {
 
     dc.onopen = () => {
       this.peerConnected = true;
-      this.onP2PConnected();
       this.onStateChange('P2P_CONNECTED');
+      // The room has done its job. Leaving now destroys it on the server immediately, so the
+      // link cannot be used by anyone else.
+      this._closeSignaling();
+      this.onP2PConnected();
     };
 
     dc.onclose = () => {
       this.peerConnected = false;
-      this.onP2PDisconnected();
       this.onStateChange('P2P_DISCONNECTED');
+      this._handleConnectionLost('Data channel closed');
     };
 
     dc.onerror = (err) => {
       console.error('DataChannel error:', err);
-      this.onError('Data channel connection error');
+      if (!this._finished) this._reportError('Data channel connection error');
     };
 
-    // Receiver DataChannel Message Listener
-    let currentMetadata = null;
-    let receiverInstance = null;
-
-    dc.onmessage = async (event) => {
-      // Handle Control JSON messages (e.g. file header with metadata & AES key)
-      if (typeof event.data === 'string') {
-        try {
-          const control = JSON.parse(event.data);
-          if (control.type === 'FILE_HEADER') {
-            currentMetadata = control;
-            const keyBuffer = hexToBuf(control.keyHex);
-
-            receiverInstance = new WebRTCFileReceiver(dc, {
-              key: keyBuffer,
-              expectedTotalChunks: control.totalChunks,
-              fileName: control.fileName,
-              fileType: control.fileType,
-              onProgress: (p) => {
-                this.onFileProgress({
-                  ...p,
-                  fileName: control.fileName,
-                  fileSize: control.fileSize,
-                  isReceiver: true
-                });
-              },
-              onComplete: (res) => {
-                this.onFileComplete({
-                  ...res,
-                  fileName: control.fileName,
-                  fileSize: control.fileSize
-                });
-              },
-              onError: (err) => {
-                this.onError(err.message || 'Decryption error on receiver');
-              }
-            });
-
-            this.onFileTransferStart({
-              fileName: control.fileName,
-              fileSize: control.fileSize,
-              totalChunks: control.totalChunks,
-              isReceiver: true
-            });
-          }
-        } catch (e) {
-          console.error('Error parsing control message:', e);
-        }
-      }
+    // Every frame goes through one queue so the (async) header decryption finishes before the
+    // first chunk is routed to the receiver.
+    dc.onmessage = (event) => {
+      this._rxQueue = this._rxQueue
+        .then(() => this._handleDataMessage(event))
+        .catch((err) => this._failTransfer(err));
     };
   }
 
+  async _handleDataMessage(event) {
+    if (typeof event.data === 'string') {
+      let control;
+      try {
+        control = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (!control || typeof control !== 'object') return;
+
+      if (control.type === 'FILE_HEADER' && !this.isInitiator) {
+        await this._handleFileHeader(control);
+      } else if (control.type === 'FILE_ACK' && this.isInitiator) {
+        this._handleFileAck(control);
+      }
+      return;
+    }
+
+    if (!this.fileReceiver) {
+      throw new Error('Received data before a file header');
+    }
+    await this.fileReceiver.handleMessage(event);
+  }
+
   /**
-   * Send a File across the DataChannel using Web Worker & AES-GCM 256-Bit
+   * Receiver: decrypt and validate the header for the next file, then start accepting its chunks.
    */
-  async sendFile(file) {
+  async _handleFileHeader(control) {
+    if (this.fileReceiver) {
+      throw new Error('Unexpected file header while a file is still arriving');
+    }
+    // The expected position is part of the header's nonce. A header that does not authenticate
+    // under the link's key at this position is rejected by AES-GCM.
+    const fileIndex = this._batch ? this._batch.nextIndex : 0;
+    let rawHeader;
+    try {
+      rawHeader = await decryptHeader(this.cryptoKey, control.header, fileIndex);
+    } catch {
+      throw new Error(
+        'Could not decrypt the file: the key in the link is wrong or data was altered'
+      );
+    }
+    const header = validateFileHeader(rawHeader, {
+      fileIndex,
+      fileCount: this._batch ? this._batch.fileCount : null,
+      totalBytes: this._batch ? this._batch.totalBytes : null
+    });
+    if (!this._batch) {
+      this._batch = { fileCount: header.fileCount, totalBytes: header.totalBytes, nextIndex: 0 };
+    }
+    this._batch.nextIndex = fileIndex + 1;
+    const isLast = fileIndex === header.fileCount - 1;
+    const batchInfo = {
+      fileName: header.fileName,
+      fileSize: header.fileSize,
+      fileIndex,
+      fileCount: header.fileCount,
+      totalBytes: header.totalBytes
+    };
+
+    // Large files stream to temporary disk storage when the browser allows it
+    const sink = await createReceiverSink(header.fileSize);
+
+    this.fileReceiver = new WebRTCFileReceiver(this.dataChannel, {
+      key: this.cryptoKey,
+      bindChannel: false,
+      fileIndex,
+      sink,
+      expectedTotalChunks: header.totalChunks,
+      expectedFileSize: header.fileSize,
+      fileName: header.fileName,
+      fileType: header.fileType,
+      onProgress: (p) => {
+        this.onFileProgress({ ...p, ...batchInfo, isReceiver: true });
+      },
+      onComplete: (res) => {
+        this.fileReceiver = null;
+        if (isLast) this._finished = true;
+        this._sendControl({ type: 'FILE_ACK', ok: true, fileIndex });
+        this.onFileComplete({ ...res, ...batchInfo, isLast, isReceiver: true });
+      },
+      onError: (err) => this._failTransfer(err)
+    });
+
+    this.onFileTransferStart({
+      ...batchInfo,
+      totalChunks: header.totalChunks,
+      isReceiver: true
+    });
+  }
+
+  /**
+   * Sender: the receiver confirmed (or rejected) the file it just got.
+   */
+  _handleFileAck(control) {
+    if (this._finished || this._failed) return;
+    if (!control.ok) {
+      this._failTransfer(new Error('The receiver rejected the transfer'));
+      return;
+    }
+    const queue = this._sendQueue;
+    if (!queue || control.fileIndex !== queue.index) {
+      this._failTransfer(new Error('Unexpected acknowledgement from the receiver'));
+      return;
+    }
+    const file = queue.files[queue.index];
+    const isLast = queue.index === queue.files.length - 1;
+    if (isLast) {
+      this._finished = true;
+      if (this.fileSender) this.fileSender.isTransferring = false;
+    }
+    this.onFileComplete({
+      fileName: file.name,
+      fileSize: file.size,
+      fileIndex: queue.index,
+      fileCount: queue.files.length,
+      totalBytes: queue.totalBytes,
+      isLast,
+      isReceiver: false
+    });
+    if (!isLast) {
+      this._sendNextFile().catch((err) => this._failTransfer(err));
+    }
+  }
+
+  _sendControl(obj) {
+    if (this.dataChannel && this.dataChannel.readyState === 'open') {
+      try {
+        this.dataChannel.send(JSON.stringify(obj));
+      } catch (err) {
+        console.error('Failed to send control message:', err);
+      }
+    }
+  }
+
+  /**
+   * Convenience wrapper for a single file.
+   */
+  sendFile(file) {
+    return this.sendFiles(file ? [file] : []);
+  }
+
+  /**
+   * Send one or more files over the DataChannel, one after another, using a Web Worker and
+   * AES-GCM 256-bit. The next file starts only after the receiver confirmed the previous one.
+   * A room carries a single batch: each file has its own nonce range under the shared key.
+   * @param {File[]|FileList} files
+   */
+  async sendFiles(files) {
     if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
       throw new Error('P2P connection is not established');
     }
-
-    if (!file) {
+    const list = Array.from(files || []);
+    if (list.length === 0) {
       throw new Error('No file provided');
     }
+    if (list.length > MAX_FILES_PER_SESSION) {
+      throw new Error(`Too many files, the limit is ${MAX_FILES_PER_SESSION} per transfer`);
+    }
+    if (this._sendQueue || !this.cryptoKey) {
+      throw new Error('Files were already sent in this room');
+    }
+    this._sendQueue = {
+      files: list,
+      index: -1,
+      totalBytes: list.reduce((sum, f) => sum + f.size, 0)
+    };
 
-    // 1. Generate 256-bit AES-GCM Key for this file transfer
-    const key = await generateAESKey();
-    const rawKeyBuffer = await exportRawKey(key);
-    const keyHex = bufToHex(rawKeyBuffer);
-    const totalChunks = Math.ceil(file.size / 65536) || 1;
-
-    // 2. Send File Header to Receiver over DataChannel
-    this.dataChannel.send(
-      JSON.stringify({
-        type: 'FILE_HEADER',
-        fileName: file.name,
-        fileSize: file.size,
-        fileType: file.type || 'application/octet-stream',
-        totalChunks,
-        keyHex
-      })
-    );
-
-    this.onFileTransferStart({
-      fileName: file.name,
-      fileSize: file.size,
-      totalChunks,
-      isReceiver: false
-    });
-
-    // 3. Instantiate Web Worker
+    // One worker and one sender serve every file in the batch
     if (this.worker) {
       this.worker.terminate();
     }
     this.worker = new Worker('/fileWorker.js');
 
-    // 4. Initialize WebRTCFileSender with backpressure
     this.fileSender = new WebRTCFileSender(this.dataChannel, {
       worker: this.worker,
       peerConnection: this.pc,
       onProgress: (p) => {
+        const queue = this._sendQueue;
+        const file = queue.files[queue.index];
+        const buffered = p.bufferedAmount || 0;
         this.onFileProgress({
           ...p,
+          // Plaintext bytes that have left the send buffer
+          bytesSent: Math.max(0, p.fileBytesQueued - buffered),
           fileName: file.name,
           fileSize: file.size,
+          fileIndex: queue.index,
+          fileCount: queue.files.length,
+          totalBytes: queue.totalBytes,
           isReceiver: false
         });
       },
-      onComplete: (res) => {
-        this.onFileComplete({
-          ...res,
-          fileName: file.name,
-          fileSize: file.size
-        });
+      onComplete: () => {
+        // Everything is queued. A file is only done once the receiver confirms it.
+        this.onStateChange('AWAITING_RECEIVER_CONFIRMATION');
       },
-      onError: (err) => {
-        this.onError(err.message || 'File send failed');
-      },
+      onError: (err) => this._failTransfer(err),
       onBackpressureChange: (isPaused, bufferedAmount) => {
         this.onBackpressureChange(isPaused, bufferedAmount);
       }
     });
 
-    // 5. Start off-thread streaming & encryption
-    this.fileSender.sendFile(file, key);
+    await this._sendNextFile();
+  }
+
+  /**
+   * Sender: announce and stream the next file in the queue.
+   */
+  async _sendNextFile() {
+    const queue = this._sendQueue;
+    queue.index++;
+    const fileIndex = queue.index;
+    const file = queue.files[fileIndex];
+    const totalChunks = Math.ceil(file.size / RAW_CHUNK_SIZE) || 1;
+
+    // The header (name, size, type, position, batch shape) is authenticated by the link's key
+    const header = await encryptHeader(
+      this.cryptoKey,
+      {
+        fileName: file.name,
+        fileSize: file.size,
+        fileType: file.type || 'application/octet-stream',
+        totalChunks,
+        fileIndex,
+        fileCount: queue.files.length,
+        totalBytes: queue.totalBytes
+      },
+      fileIndex
+    );
+    if (this._failed || !this.dataChannel) return;
+    this.dataChannel.send(JSON.stringify({ type: 'FILE_HEADER', header }));
+
+    this.onFileTransferStart({
+      fileName: file.name,
+      fileSize: file.size,
+      totalChunks,
+      fileIndex,
+      fileCount: queue.files.length,
+      totalBytes: queue.totalBytes,
+      isReceiver: false
+    });
+
+    this.fileSender.sendFile(file, this.cryptoKey, fileIndex);
   }
 
   /**
@@ -428,43 +718,111 @@ class WebRTCManager {
     this._teardownP2P();
   }
 
+  /**
+   * Report an error once and tear everything down.
+   */
+  _failTransfer(err) {
+    if (this._finished || this._failed) return;
+    this._failed = true;
+    // Tell the other side so it does not wait forever
+    this._sendControl({ type: 'FILE_ACK', ok: false });
+    this._reportError(err && err.message ? err.message : 'Transfer failed');
+    this._teardownP2P();
+    this.onP2PDisconnected();
+  }
+
+  /**
+   * The peer connection or data channel went away.
+   */
+  _handleConnectionLost(reason) {
+    if (this._finished || this._failed) return;
+    this._failed = true;
+    this._teardownP2P();
+    this._reportError(`Connection lost: ${reason}`);
+    this.onP2PDisconnected();
+  }
+
+  _reportError(message) {
+    this.onError(message);
+  }
+
+  _closeSignaling() {
+    if (this.ws) {
+      const ws = this.ws;
+      this.ws = null;
+      ws.onclose = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      try {
+        ws.close();
+      } catch {}
+    }
+  }
+
   _teardownP2P() {
     if (this.worker) {
       this.worker.terminate();
       this.worker = null;
     }
-    if (this.dataChannel) {
-      try {
-        this.dataChannel.close();
-      } catch {}
-      this.dataChannel = null;
-    }
-    if (this.pc) {
-      try {
-        this.pc.close();
-      } catch {}
-      this.pc = null;
-    }
+    const dc = this.dataChannel;
+    const pc = this.pc;
+    this.dataChannel = null;
+    this.pc = null;
     this.peerConnected = false;
+    if (dc) {
+      dc.onclose = null;
+      dc.onerror = null;
+      dc.onmessage = null;
+      try {
+        dc.close();
+      } catch {}
+    }
+    if (pc) {
+      try {
+        pc.close();
+      } catch {}
+    }
+  }
+
+  _resetSession() {
+    this._teardownP2P();
+    this._closeSignaling();
+    this._signalingQueue = Promise.resolve();
+    this._rxQueue = Promise.resolve();
+    this._pendingCandidates = [];
+    this._finished = false;
+    this._failed = false;
+    this._sendQueue = null;
+    this._batch = null;
+    this.fileSender = null;
+    this.fileReceiver = null;
+    this.cryptoKey = null;
+    this.keyBase64Url = null;
+    this.roomCode = null;
   }
 
   /**
-   * Complete teardown and disconnect
+   * Complete teardown and disconnect. Closing is deliberate, so it is not reported as an error.
    */
   disconnect() {
+    this._finished = true;
     this._teardownP2P();
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch {}
-      this.ws = null;
-    }
+    this._closeSignaling();
     this.roomCode = null;
     this.isInitiator = false;
+    this.cryptoKey = null;
+    this.keyBase64Url = null;
   }
+}
+
+// Pure helpers are exported for Node tests; the class itself needs browser APIs.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { sanitizeFileName, validateFileHeader };
 }
 
 // Global attachment
 if (typeof window !== 'undefined') {
   window.WebRTCManager = WebRTCManager;
+  window.sanitizeFileName = sanitizeFileName;
+  window.validateFileHeader = validateFileHeader;
 }

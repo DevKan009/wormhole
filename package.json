@@ -6,9 +6,11 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "test": "node test.js && node test-chunker.js && node test-crypto.js && node test-webrtc-backpressure.js",
+    "test": "node test.js && node test-chunker.js && node test-crypto.js && node test-webrtc-backpressure.js && node test-protocol.js",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "vendor:qr": "node -e \"require('fs').copyFileSync('node_modules/qrcode-generator/dist/qrcode.js','public/vendor/qrcode.js')\"",
+    "e2e": "node e2e/run.js"
   },
   "keywords": [
     "webrtc",
@@ -21,6 +23,9 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "prettier": "^3.9.6"
+    "axe-core": "^4.10.2",
+    "playwright-core": "^1.49.1",
+    "prettier": "^3.9.6",
+    "qrcode-generator": "^2.0.4"
   }
 }

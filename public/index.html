@@ -3,317 +3,342 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>EphemeralShare | Zero-Retention E2EE WebRTC File Sharing</title>
+    <meta name="color-scheme" content="light dark" />
+    <title>EphemeralShare | Private file transfer</title>
     <meta
       name="description"
-      content="Direct browser-to-browser file transfer over WebRTC Data Channels with zero server-side storage and end-to-end client-side AES-GCM encryption."
+      content="Send files directly to another browser. Encrypted on your device with AES-256-GCM, never stored on a server."
     />
-
-    <!-- Google Fonts: Outfit & JetBrains Mono -->
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Outfit:wght@400;500;600;700;800&display=swap"
-      rel="stylesheet"
-    />
-
+    <meta name="referrer" content="no-referrer" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <div class="app-container">
-      <!-- Application Header -->
-      <header class="app-header">
-        <div class="brand-badge">
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-          </svg>
-          <span>Zero-Retention P2P Relay</span>
-        </div>
-        <h1 class="app-title">EphemeralShare</h1>
-        <p class="app-tagline">
-          Direct browser-to-browser encrypted file delivery over WebRTC. Files stream in 64 KB
-          slices off the main thread with zero server retention.
+    <!-- Icon sprite: decorative icons are referenced with <use> and hidden from assistive tech -->
+    <svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
+      <defs>
+        <symbol id="i-shield" viewBox="0 0 24 24">
+          <path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3z" />
+          <path d="M9 12l2 2 4-4" />
+        </symbol>
+        <symbol id="i-upload" viewBox="0 0 24 24">
+          <path d="M12 16V4" />
+          <path d="M7 9l5-5 5 5" />
+          <path d="M5 20h14" />
+        </symbol>
+        <symbol id="i-download" viewBox="0 0 24 24">
+          <path d="M12 4v12" />
+          <path d="M7 11l5 5 5-5" />
+          <path d="M5 20h14" />
+        </symbol>
+        <symbol id="i-file" viewBox="0 0 24 24">
+          <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+          <path d="M14 3v5h5" />
+        </symbol>
+        <symbol id="i-copy" viewBox="0 0 24 24">
+          <rect x="9" y="9" width="11" height="11" rx="2" />
+          <path d="M5 15V6a2 2 0 0 1 2-2h8" />
+        </symbol>
+        <symbol id="i-qr" viewBox="0 0 24 24">
+          <rect x="3" y="3" width="7" height="7" rx="1" />
+          <rect x="14" y="3" width="7" height="7" rx="1" />
+          <rect x="3" y="14" width="7" height="7" rx="1" />
+          <path d="M14 14h3v3h-3zM20 14v3M17 20h4" />
+        </symbol>
+        <symbol id="i-x" viewBox="0 0 24 24">
+          <path d="M6 6l12 12M18 6L6 18" />
+        </symbol>
+        <symbol id="i-check" viewBox="0 0 24 24">
+          <path d="M5 12.5l4.5 4.5L19 7.5" />
+        </symbol>
+        <symbol id="i-alert" viewBox="0 0 24 24">
+          <path d="M12 3l10 18H2z" />
+          <path d="M12 10v4M12 17.5v.01" />
+        </symbol>
+        <symbol id="i-info" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 11v5M12 7.5v.01" />
+        </symbol>
+        <symbol id="i-circle" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="7" />
+        </symbol>
+        <symbol id="i-plus" viewBox="0 0 24 24">
+          <path d="M12 5v14M5 12h14" />
+        </symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24">
+          <path d="M20 12a8 8 0 1 1-2.3-5.7" />
+          <path d="M20 4v5h-5" />
+        </symbol>
+      </defs>
+    </svg>
+
+    <div class="shell">
+      <header class="site-header">
+        <h1 class="wordmark">
+          <svg class="icon icon-lg" aria-hidden="true"><use href="#i-shield" /></svg>
+          <span>EphemeralShare</span>
+        </h1>
+        <p class="lede">
+          Send files straight to another browser. They're encrypted on your device and never stored
+          on a server.
         </p>
       </header>
 
-      <!-- Mode Selector Tabs -->
-      <nav class="mode-tabs" aria-label="Transfer Mode">
-        <button id="tabSend" class="tab-btn active" type="button">
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <line x1="22" y1="2" x2="11" y2="13"></line>
-            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-          </svg>
-          <span>Send File</span>
+      <!-- Persistent error banner: stays until dismissed or the user starts over -->
+      <div id="alertBox" class="alert" role="alert" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#i-alert" /></svg>
+        <p id="alertText" class="alert-text"></p>
+        <button id="btnAlertAction" class="btn btn-secondary btn-sm" type="button">
+          Start over
         </button>
-        <button id="tabReceive" class="tab-btn" type="button">
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-            <polyline points="7 10 12 15 17 10"></polyline>
-            <line x1="12" y1="15" x2="12" y2="3"></line>
-          </svg>
-          <span>Receive File</span>
-        </button>
-      </nav>
+      </div>
 
-      <!-- VIEW: SENDER MODE -->
-      <main id="viewSend" class="view-panel active">
-        <!-- File Dropzone -->
-        <div id="dropZone" class="drop-zone">
-          <input type="file" id="fileInput" style="display: none" />
-          <div class="drop-icon-container">
-            <svg
-              width="32"
-              height="32"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
+      <main>
+        <div id="modeCard" class="card">
+          <div class="tabs" role="tablist" aria-label="Transfer mode">
+            <button
+              id="tabSend"
+              class="tab"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              aria-controls="viewSend"
             >
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-              <polyline points="17 8 12 3 7 8"></polyline>
-              <line x1="12" y1="3" x2="12" y2="15"></line>
-            </svg>
+              <svg class="icon" aria-hidden="true"><use href="#i-upload" /></svg>
+              <span>Send</span>
+            </button>
+            <button
+              id="tabReceive"
+              class="tab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="viewReceive"
+              tabindex="-1"
+            >
+              <svg class="icon" aria-hidden="true"><use href="#i-download" /></svg>
+              <span>Receive</span>
+            </button>
           </div>
-          <h3>Drop any file here or click to browse</h3>
-          <p>Unlimited file size • Off-thread chunking • 256-bit AES-GCM encrypted</p>
-          <div class="file-specs">
-            <span>64 KB Chunk Pipeline</span>
-            <span>•</span>
-            <span>1 MB Backpressure Limit</span>
-          </div>
-        </div>
 
-        <!-- File Selected Pill -->
-        <div id="fileCard" class="file-card">
-          <div class="file-info">
-            <div class="file-icon">
-              <svg
-                width="22"
-                height="22"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              >
-                <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
-                <polyline points="13 2 13 9 20 9"></polyline>
-              </svg>
+          <!-- SEND -->
+          <section id="viewSend" class="panel" role="tabpanel" aria-labelledby="tabSend">
+            <label id="dropZone" class="dropzone" for="fileInput">
+              <input id="fileInput" class="visually-hidden" type="file" multiple />
+              <span class="dropzone-icon">
+                <svg class="icon icon-lg" aria-hidden="true"><use href="#i-upload" /></svg>
+              </span>
+              <span class="dropzone-title">Choose files to send</span>
+              <span class="dropzone-sub">
+                Drop them here or <span class="link-like">browse</span>. Any type, any size.
+              </span>
+            </label>
+
+            <div id="fileCard" class="stack" hidden>
+              <div class="section-head">
+                <h2 id="fileCardTitle" class="section-title">Files</h2>
+                <div class="section-actions">
+                  <button id="btnAddMore" class="btn btn-secondary btn-sm" type="button">
+                    <svg class="icon" aria-hidden="true"><use href="#i-plus" /></svg>
+                    <span>Add more</span>
+                  </button>
+                  <button id="btnClearFiles" class="btn btn-ghost btn-sm" type="button">
+                    Clear
+                  </button>
+                </div>
+              </div>
+              <ul id="fileList" class="file-list" aria-label="Selected files"></ul>
             </div>
-            <div class="file-meta">
-              <h4 id="selectedFileName">filename.ext</h4>
-              <span id="selectedFileSize">0 MB</span>
+
+            <div id="shareCard" class="share" hidden>
+              <div class="section-head">
+                <h2 class="section-title">Share this link</h2>
+                <span id="waitStatus" class="wait" role="status">
+                  <span class="dot dot-pulse" aria-hidden="true"></span>
+                  <span id="waitStatusText">Preparing a secure room…</span>
+                </span>
+              </div>
+
+              <div class="field-row">
+                <input
+                  id="shareLinkInput"
+                  class="input input-mono"
+                  type="text"
+                  readonly
+                  aria-label="Share link"
+                  spellcheck="false"
+                  autocomplete="off"
+                />
+                <button id="btnCopyLink" class="btn btn-primary" type="button">
+                  <svg class="icon" aria-hidden="true"><use href="#i-copy" /></svg>
+                  <span id="btnCopyLabel">Copy link</span>
+                </button>
+              </div>
+              <p class="help">
+                Send it over any channel. Whoever has the full link can receive these files, and it
+                stops working as soon as someone connects. The part after # is the decryption key
+                and never reaches our server.
+              </p>
+
+              <div class="share-footer">
+                <span class="code-label">
+                  Room
+                  <span id="senderRoomCode" class="code" translate="no">------</span>
+                </span>
+                <button
+                  id="btnShowQR"
+                  class="btn btn-ghost btn-sm"
+                  type="button"
+                  aria-expanded="false"
+                  aria-controls="qrPanel"
+                >
+                  <svg class="icon" aria-hidden="true"><use href="#i-qr" /></svg>
+                  <span>Show QR code</span>
+                </button>
+              </div>
+
+              <div id="qrPanel" class="qr-panel" hidden>
+                <div id="qrCode" class="qr"></div>
+                <p class="help">Scan with another device's camera to open the link.</p>
+              </div>
             </div>
-          </div>
-          <button
-            id="btnRemoveFile"
-            class="btn btn-secondary"
-            style="padding: 0.5rem 0.75rem"
-            type="button"
+          </section>
+
+          <!-- RECEIVE -->
+          <section
+            id="viewReceive"
+            class="panel"
+            role="tabpanel"
+            aria-labelledby="tabReceive"
+            hidden
           >
-            Change
-          </button>
+            <div class="stack">
+              <div>
+                <h2 class="section-title">Receive files</h2>
+                <p class="help">
+                  Paste the link the sender gave you. It includes the key that decrypts the files.
+                </p>
+              </div>
+
+              <div class="field">
+                <label class="label" for="receiverLinkInput">Share link</label>
+                <input
+                  id="receiverLinkInput"
+                  class="input input-mono"
+                  type="text"
+                  inputmode="url"
+                  placeholder="https://…/#ABC123.…"
+                  autocomplete="off"
+                  autocapitalize="off"
+                  spellcheck="false"
+                  aria-describedby="receiveHint"
+                />
+                <p id="receiveHint" class="field-hint" role="status"></p>
+              </div>
+
+              <button id="btnJoinRoom" class="btn btn-primary btn-block" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#i-download" /></svg>
+                <span id="btnJoinLabel">Connect and download</span>
+              </button>
+            </div>
+          </section>
         </div>
 
-        <!-- Room Code Output Card -->
-        <div id="senderRoomCard" class="room-card" style="display: none">
-          <div class="room-code-label">Share This 6-Character Room Code</div>
-          <div id="senderRoomCode" class="room-code-display">------</div>
-          <div class="room-actions">
-            <button id="btnCopyLink" class="btn btn-primary" type="button">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              >
-                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-              </svg>
-              <span>Copy Link</span>
-            </button>
-            <button id="btnShowQR" class="btn btn-secondary" type="button">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              >
-                <rect x="3" y="3" width="7" height="7"></rect>
-                <rect x="14" y="3" width="7" height="7"></rect>
-                <rect x="14" y="14" width="7" height="7"></rect>
-                <rect x="3" y="14" width="7" height="7"></rect>
-              </svg>
-              <span>Show QR Code</span>
+        <!-- TRANSFER -->
+        <section id="transferPanel" class="card transfer" aria-labelledby="transferTitle" hidden>
+          <div class="section-head">
+            <div>
+              <h2 id="transferTitle" class="section-title">Transfer</h2>
+              <p id="transferSubtitle" class="help help-tight"></p>
+            </div>
+            <span id="transferBadge" class="badge" data-tone="info">
+              <span class="dot" aria-hidden="true"></span>
+              <span id="transferStatusText">Connecting</span>
+            </span>
+          </div>
+
+          <div
+            id="overallBar"
+            class="progress"
+            role="progressbar"
+            aria-label="Overall progress"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="0"
+          >
+            <div id="overallFill" class="progress-fill"></div>
+          </div>
+
+          <dl class="stats">
+            <div class="stat">
+              <dt>Progress</dt>
+              <dd id="metricProgress">0%</dd>
+            </div>
+            <div class="stat">
+              <dt>Speed</dt>
+              <dd id="metricSpeed">–</dd>
+            </div>
+            <div class="stat">
+              <dt>Transferred</dt>
+              <dd id="metricTransferred">–</dd>
+            </div>
+            <div class="stat">
+              <dt>Time left</dt>
+              <dd id="metricEta">–</dd>
+            </div>
+          </dl>
+
+          <ul id="transferList" class="xfer-list" aria-label="Files in this transfer"></ul>
+
+          <p id="transferNote" class="help" hidden></p>
+
+          <div id="transferActions" class="actions" hidden>
+            <button id="btnTransferReset" class="btn btn-primary" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh" /></svg>
+              <span id="btnTransferResetLabel">Send more files</span>
             </button>
           </div>
-        </div>
+        </section>
       </main>
 
-      <!-- VIEW: RECEIVER MODE -->
-      <section id="viewReceive" class="view-panel">
-        <div class="join-container">
-          <h3>Receive Encrypted File</h3>
-          <p style="color: var(--text-muted); font-size: 0.95rem; margin-top: 0.25rem">
-            Enter the 6-character room code from the sender device.
-          </p>
+      <aside aria-label="Privacy">
+        <details class="privacy">
+          <summary>How your files stay private</summary>
+          <ul>
+            <li>
+              Files are read in 64 KB pieces and encrypted with AES-256-GCM in your browser, away
+              from the page's main thread.
+            </li>
+            <li>
+              The key is made on the sender's device and lives only in the link after the #.
+              Browsers never send that part to a server.
+            </li>
+            <li>
+              The server only introduces the two browsers. After that they talk directly, and the
+              room is deleted as soon as they connect.
+            </li>
+            <li>
+              Nothing is written to a server. If a direct connection is impossible, an optional
+              relay forwards data that is already encrypted.
+            </li>
+          </ul>
+        </details>
+      </aside>
 
-          <div class="code-input-group">
-            <input
-              type="text"
-              id="receiverCodeInput"
-              class="code-input"
-              placeholder="ABC123"
-              maxlength="6"
-              autocomplete="off"
-              spellcheck="false"
-            />
-          </div>
-
-          <button id="btnJoinRoom" class="btn btn-primary btn-block" type="button">
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            >
-              <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path>
-              <polyline points="10 17 15 12 10 7"></polyline>
-              <line x1="15" y1="12" x2="3" y2="12"></line>
-            </svg>
-            <span>Connect & Download</span>
-          </button>
-        </div>
-      </section>
-
-      <!-- LIVE TRANSFER DASHBOARD (Shared across sender and receiver) -->
-      <section id="transferDashboard" class="transfer-dashboard" aria-live="polite">
-        <div class="transfer-header">
-          <div>
-            <span style="font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase"
-              >Active Transfer</span
-            >
-            <h4 id="transferFileName" style="font-size: 1.1rem; font-weight: 700">
-              transferring-file.bin
-            </h4>
-          </div>
-          <div id="transferStatusBadge" class="status-badge streaming">
-            <span class="status-pulse"></span>
-            <span id="transferStatusText">P2P Streaming</span>
-          </div>
-        </div>
-
-        <div class="progress-container">
-          <div id="progressBar" class="progress-bar"></div>
-        </div>
-
-        <div class="metrics-grid">
-          <div class="metric-box">
-            <div class="metric-title">Progress</div>
-            <div id="metricProgress" class="metric-value">0%</div>
-          </div>
-          <div class="metric-box">
-            <div class="metric-title">Speed</div>
-            <div id="metricSpeed" class="metric-value">0.00 MB/s</div>
-          </div>
-          <div class="metric-box">
-            <div class="metric-title">Transferred</div>
-            <div id="metricTransferred" class="metric-value">0 B / 0 B</div>
-          </div>
-          <div class="metric-box">
-            <div class="metric-title">ETA</div>
-            <div id="metricEta" class="metric-value">--</div>
-          </div>
-        </div>
-      </section>
-
-      <!-- Architectural Security Specifications -->
-      <footer class="security-badge-row">
-        <div class="sec-pill">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-          </svg>
-          <span>AES-GCM 256-Bit</span>
-        </div>
-        <div class="sec-pill">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <polyline points="20 6 9 17 4 12" />
-          </svg>
-          <span>Deterministic 96-Bit Nonces</span>
-        </div>
-        <div class="sec-pill">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <circle cx="12" cy="12" r="10" />
-            <polyline points="12 6 12 12 16 14" />
-          </svg>
-          <span>Strict 64 KB Slices</span>
-        </div>
-        <div class="sec-pill">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
-          </svg>
-          <span>1MB / 256KB Flow Control</span>
-        </div>
-        <div class="sec-pill">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <polyline points="3 6 5 6 21 6"></polyline>
-            <path
-              d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"
-            ></path>
-          </svg>
-          <span>Instant Teardown on Disconnect</span>
-        </div>
+      <footer class="site-footer">
+        <span>No accounts. No tracking. No third-party requests.</span>
       </footer>
     </div>
 
-    <!-- QR Code Modal -->
-    <div id="qrModal" class="modal-overlay">
-      <div class="modal-card">
-        <h3>Scan to Receive</h3>
-        <p style="color: var(--text-muted); font-size: 0.85rem; margin-top: 0.25rem">
-          Scan with another device to open the download room
-        </p>
-        <div class="qr-canvas-container">
-          <canvas id="qrCanvas" width="220" height="220"></canvas>
-        </div>
-        <button id="btnCloseQR" class="btn btn-secondary btn-block" type="button">Close</button>
-      </div>
-    </div>
+    <div
+      id="toastContainer"
+      class="toast-container"
+      role="status"
+      aria-live="polite"
+      aria-atomic="false"
+    ></div>
 
-    <!-- Toast Notification Container -->
-    <div id="toastContainer" class="toast-container" aria-live="assertive"></div>
-
-    <!-- Scripts -->
+    <script src="/vendor/qrcode.js"></script>
     <script src="/fileChunker.js"></script>
     <script src="/chunkCrypto.js"></script>
     <script src="/webrtcSender.js"></script>
