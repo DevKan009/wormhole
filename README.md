@@ -236,6 +236,7 @@ Set `E2E_SHOTS=./e2e-shots` to keep screenshots. The browser is launched with mD
 ### Test Coverage:
 
 - **`e2e/transfer.js`**: five files over a real WebRTC connection (2 MB, 300 KB, exactly two chunks, 70 MB through disk-backed storage, 0 bytes), each verified byte for byte with SHA-256; confirms the key never appears in a signaling message and is stripped from the address bar, and that the strict CSP produces no console errors.
+- **`e2e/speed.js`**: 40 small files, like a phone gallery. Every file must arrive in order and byte for byte, and the Speed figure must show during the transfer and stay as an average afterwards.
 - **`e2e/wakeup.js`**: the server goes away after the page loads and returns seconds later. The page explains the delay, keeps retrying, then creates the room and completes a transfer.
 - **`e2e/ui.js`**: axe accessibility audits of every screen in light and dark, keyboard tab navigation and focus ring, inline validation, wrong key, expired link, sender dropping mid-transfer, and reset.
 - **`test-resilience.js`**: Metered credential fetching (caching, back-off, stale-on-error, key never logged, host-injection guards), every server limit against a real WebSocket server (flood, code guessing, per-address and global caps, room creation rate, room expiry, proxy handling), and the client's retry, keepalive and reconnect-grace logic.

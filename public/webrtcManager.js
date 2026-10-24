@@ -640,13 +640,15 @@ class WebRTCManager {
       this._failTransfer(new Error('The receiver rejected the transfer'));
       return;
     }
+    // Confirmations arrive in order, for files that have already been started
     const queue = this._sendQueue;
-    if (!queue || control.fileIndex !== queue.index) {
+    if (!queue || control.fileIndex !== queue.acked || control.fileIndex > queue.index) {
       this._failTransfer(new Error('Unexpected acknowledgement from the receiver'));
       return;
     }
-    const file = queue.files[queue.index];
-    const isLast = queue.index === queue.files.length - 1;
+    const fileIndex = queue.acked++;
+    const file = queue.files[fileIndex];
+    const isLast = fileIndex === queue.files.length - 1;
     if (isLast) {
       this._finished = true;
       if (this.fileSender) this.fileSender.isTransferring = false;
@@ -654,15 +656,12 @@ class WebRTCManager {
     this.onFileComplete({
       fileName: file.name,
       fileSize: file.size,
-      fileIndex: queue.index,
+      fileIndex,
       fileCount: queue.files.length,
       totalBytes: queue.totalBytes,
       isLast,
       isReceiver: false
     });
-    if (!isLast) {
-      this._sendNextFile().catch((err) => this._failTransfer(err));
-    }
   }
 
   _sendControl(obj) {
@@ -684,7 +683,7 @@ class WebRTCManager {
 
   /**
    * Send one or more files over the DataChannel, one after another, using a Web Worker and
-   * AES-GCM 256-bit. The next file starts only after the receiver confirmed the previous one.
+   * AES-GCM 256-bit. Files follow each other without waiting for confirmations.
    * A room carries a single batch: each file has its own nonce range under the shared key.
    * @param {File[]|FileList} files
    */
@@ -704,7 +703,8 @@ class WebRTCManager {
     }
     this._sendQueue = {
       files: list,
-      index: -1,
+      index: -1, // the file being sent (or last queued)
+      acked: 0, // files the receiver has confirmed, in order
       totalBytes: list.reduce((sum, f) => sum + f.size, 0)
     };
 
@@ -735,8 +735,16 @@ class WebRTCManager {
         });
       },
       onComplete: () => {
-        // Everything is queued. A file is only done once the receiver confirms it.
-        this.onStateChange('AWAITING_RECEIVER_CONFIRMATION');
+        // The file is fully queued. It is only done once the receiver confirms it, but the next
+        // one starts right away: waiting a round trip per file made batches of small files (phone
+        // photos) crawl on slow or relayed links. The channel delivers in order, and the receiver
+        // handles one file at a time, so nothing interleaves.
+        const queue = this._sendQueue;
+        if (queue.index < queue.files.length - 1) {
+          this._sendNextFile().catch((err) => this._failTransfer(err));
+        } else {
+          this.onStateChange('AWAITING_RECEIVER_CONFIRMATION');
+        }
       },
       onError: (err) => this._failTransfer(err),
       onBackpressureChange: (isPaused, bufferedAmount) => {

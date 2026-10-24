@@ -257,8 +257,12 @@ document.addEventListener('DOMContentLoaded', () => {
       row.state = 'active';
       row.bytes = 0;
       xfer.current = info.fileIndex;
-      xfer.speed = 0;
-      xfer.sample = { t: performance.now(), bytes: xfer.doneBytes };
+      // The sender starts a file once the previous one is fully queued, before it is confirmed
+      xfer.files.forEach((other, i) => {
+        if (i < info.fileIndex && other.state === 'active') other.bytes = other.size;
+      });
+      // Speed keeps running across files: resetting it here left batches of small files (phone
+      // photos) with no speed at all, because each file ended before the first 0.5 s sample.
       setBadge(info.isReceiver ? 'Receiving' : 'Sending', 'info');
       transferStatusText.textContent = info.isReceiver ? 'Receiving' : 'Sending';
       showTransferPanel();
@@ -658,6 +662,8 @@ document.addEventListener('DOMContentLoaded', () => {
       doneBytes: 0,
       current: 0,
       speed: 0,
+      startedAt: performance.now(),
+      endedAt: null,
       sample: { t: performance.now(), bytes: 0 },
       files: Array.from({ length: count }, (_, i) => {
         const known = !info.isReceiver ? files[i] : null;
@@ -728,9 +734,21 @@ document.addEventListener('DOMContentLoaded', () => {
     xfer.sample = { t: now, bytes: total };
   }
 
+  // Files can overlap: the sender starts the next one before the previous is confirmed
   function overallBytes() {
-    const active = xfer.files[xfer.current];
-    return xfer.doneBytes + (active && active.state === 'active' ? active.bytes : 0);
+    return xfer.files.reduce(
+      (sum, row) =>
+        sum + (row.state === 'done' ? row.size : row.state === 'active' ? row.bytes : 0),
+      0
+    );
+  }
+
+  // Average since the transfer began; used until the smoothed live speed has a first sample, and
+  // as the final figure once the transfer is over
+  function averageSpeed() {
+    const end = xfer.endedAt || performance.now();
+    const seconds = (end - xfer.startedAt) / 1000;
+    return seconds >= 0.3 ? overallBytes() / seconds : 0;
   }
 
   function scheduleRender() {
@@ -752,13 +770,15 @@ document.addEventListener('DOMContentLoaded', () => {
     overallBar.setAttribute('aria-valuenow', String(pct));
     metricProgress.textContent = `${pct}%`;
     metricTransferred.textContent = `${formatBytes(done)} / ${formatBytes(total)}`;
-    metricSpeed.textContent = xfer.speed > 0 ? `${formatBytes(xfer.speed)}/s` : '–';
+    const speed =
+      phase() === 'done' ? averageSpeed() : xfer.speed > 0 ? xfer.speed : averageSpeed();
+    metricSpeed.textContent = speed > 0 ? `${formatBytes(speed)}/s` : '–';
     const remaining = Math.max(0, total - done);
     metricEta.textContent =
       phase() === 'done'
         ? '0s'
-        : xfer.speed > 0 && remaining > 0
-          ? formatDuration(remaining / xfer.speed)
+        : speed > 0 && remaining > 0
+          ? formatDuration(remaining / speed)
           : '–';
 
     xfer.files.forEach((row, index) => {
@@ -809,6 +829,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function finishTransfer(isReceiver) {
     releaseWakeLock();
+    xfer.endedAt = performance.now();
     currentPhase = 'done';
     setBadge('Complete', 'success');
     transferTitle.textContent = isReceiver ? 'Received' : 'Sent';
