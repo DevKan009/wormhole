@@ -93,6 +93,12 @@
         </button>
       </div>
 
+      <!-- Shown while the (free-tier) server wakes up. Informational, not an error. -->
+      <div id="noticeBox" class="notice" role="status" hidden>
+        <span class="dot dot-pulse" aria-hidden="true"></span>
+        <p id="noticeText" class="notice-text"></p>
+      </div>
+
       <main>
         <div id="modeCard" class="card">
           <div class="tabs" role="tablist" aria-label="Transfer mode">

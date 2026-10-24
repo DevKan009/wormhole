@@ -6,7 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "test": "node test.js && node test-chunker.js && node test-crypto.js && node test-webrtc-backpressure.js && node test-protocol.js",
+    "test": "node test.js && node test-chunker.js && node test-crypto.js && node test-webrtc-backpressure.js && node test-protocol.js && node test-resilience.js",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "vendor:qr": "node -e \"require('fs').copyFileSync('node_modules/qrcode-generator/dist/qrcode.js','public/vendor/qrcode.js')\"",

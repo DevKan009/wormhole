@@ -891,6 +891,30 @@ main {
 }
 
 /* --------------------------------------------------------------------------
+   Notice banner (informational, for example while the server wakes up)
+   -------------------------------------------------------------------------- */
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.notice .dot {
+  margin-top: 0.5rem;
+}
+
+.notice-text {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  text-wrap: pretty;
+}
+
+/* --------------------------------------------------------------------------
    Toasts (transient confirmations only)
    -------------------------------------------------------------------------- */
 .toast-container {

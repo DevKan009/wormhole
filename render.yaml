@@ -1,12 +1,42 @@
+# Render Blueprint for EphemeralShare (free web service).
+# Dashboard: New > Blueprint > pick this repo. Variables marked `sync: false` are asked for once
+# and kept in Render, never in git. Full walkthrough: README.md, "Deploying on Render".
 services:
   - type: web
     name: ephemeral-share
     env: node
     plan: free
     region: singapore
-    buildCommand: npm install
+    # Production dependencies only: skips the browser-test tooling
+    buildCommand: npm ci --omit=dev
     startCommand: npm start
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: '22'
+
+      # Abuse limits, sized for a 512 MB free instance
+      - key: MAX_ROOMS
+        value: '500'
+      - key: MAX_CONNECTIONS
+        value: '300'
+      # Rooms older than this are deleted even if nobody joined (minutes)
+      - key: ROOM_MAX_AGE_MIN
+        value: '60'
+      # Per-address limits (connections, rooms per minute) need to know how many proxies sit in
+      # front of the server. Until this is set they stay off. See the README before enabling.
+      # - key: TRUST_PROXY_HOPS
+      #   value: '1'
+
+      # Free TURN relay for networks where a direct connection is impossible (Metered, 500 MB/month
+      # on the free plan). In the Metered dashboard: TURN Server > Credentials > New credential,
+      # then paste the username and password. Leave all three empty to run on STUN only.
+      # TURN_URL: turn:global.relay.metered.ca:80,turn:global.relay.metered.ca:80?transport=tcp,turn:global.relay.metered.ca:443,turns:global.relay.metered.ca:443?transport=tcp
+      - key: TURN_URL
+        sync: false
+      - key: TURN_USERNAME
+        sync: false
+      - key: TURN_CREDENTIAL
+        sync: false

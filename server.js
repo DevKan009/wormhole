@@ -146,6 +146,142 @@ function buildIceConfig(env = process.env, nowMs = Date.now()) {
 }
 
 /**
+ * Abuse limits. Every value can be overridden with an environment variable or options.limits.
+ * Per-connection and global limits always apply. Per-IP limits only apply when the address is
+ * trustworthy, see clientIp().
+ */
+function resolveLimits(env = process.env, overrides = {}) {
+  const num = (value, fallback) => {
+    const n = parseInt(value, 10);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  return {
+    maxRooms: num(env.MAX_ROOMS, MAX_ROOMS),
+    maxConnections: num(env.MAX_CONNECTIONS, 1000),
+    maxConnectionsPerIp: num(env.MAX_CONNECTIONS_PER_IP, 8),
+    maxRoomsPerIpPerMinute: num(env.MAX_ROOMS_PER_IP_PER_MIN, 10),
+    maxMessagesPerWindow: num(env.MAX_MESSAGES_PER_10S, 100),
+    maxFailedJoins: num(env.MAX_FAILED_JOINS, 5),
+    maxIceMissesPerMinute: num(env.MAX_ICE_MISSES_PER_MIN, 60),
+    roomMaxAgeMs: num(env.ROOM_MAX_AGE_MIN, 60) * 60 * 1000,
+    trustProxyHops: parseInt(env.TRUST_PROXY_HOPS, 10) > 0 ? parseInt(env.TRUST_PROXY_HOPS, 10) : 0,
+    ...overrides
+  };
+}
+
+/**
+ * The address to apply per-IP limits to, or null when it cannot be known safely.
+ *
+ * Behind a reverse proxy every socket comes from the proxy, so keying limits by socket address
+ * would put all visitors in one bucket and lock everyone out. X-Forwarded-For entries are
+ * appended by each proxy and the leftmost ones can be forged by the client. So behind a proxy the
+ * per-IP limits stay off until TRUST_PROXY_HOPS says how many proxies to trust, and then the
+ * entry that many places from the right is used.
+ *
+ * @param {http.IncomingMessage} req
+ * @param {number} trustProxyHops
+ * @returns {string|null}
+ */
+function clientIp(req, trustProxyHops) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (!forwarded) return req.socket.remoteAddress || null;
+  if (trustProxyHops > 0) {
+    const parts = String(forwarded)
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return parts[parts.length - trustProxyHops] || null;
+  }
+  return null;
+}
+
+const METERED_CACHE_MS = 10 * 60 * 1000;
+const METERED_RETRY_MS = 30 * 1000;
+const METERED_TIMEOUT_MS = 4000;
+const ICE_URL_PATTERN = /^(stun|stuns|turn|turns):/i;
+
+/**
+ * Keeps only well-formed ICE server entries from an upstream response, so a bad or hostile
+ * response can never hand browsers anything but STUN/TURN URLs and plain credentials.
+ * @param {unknown} list
+ * @returns {object[]}
+ */
+function sanitizeIceServers(list) {
+  if (!Array.isArray(list)) return [];
+  const servers = [];
+  for (const entry of list.slice(0, 10)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const urls = (Array.isArray(entry.urls) ? entry.urls : [entry.urls]).filter(
+      (u) => typeof u === 'string' && ICE_URL_PATTERN.test(u) && u.length < 200
+    );
+    if (urls.length === 0) continue;
+    const server = { urls };
+    if (typeof entry.username === 'string') server.username = entry.username;
+    if (typeof entry.credential === 'string') server.credential = entry.credential;
+    servers.push(server);
+  }
+  return servers;
+}
+
+/**
+ * Returns an async function that produces the ICE config for /ice-config.
+ *
+ * On top of buildIceConfig() it can pull TURN credentials from Metered (free Open Relay plan):
+ *   METERED_APP      your Metered app name, e.g. "myapp" for myapp.metered.live
+ *   METERED_API_KEY  the API key from the Metered dashboard. It stays on the server.
+ * Credentials are cached for ten minutes and refreshed lazily. If Metered is unreachable the
+ * response degrades to STUN-only (or the last good credentials) instead of failing.
+ *
+ * @param {object} [env]
+ * @param {{ fetchImpl?: Function, now?: () => number, cacheMs?: number, retryMs?: number }} [options]
+ * @returns {() => Promise<{ iceServers: object[] }>}
+ */
+function createIceConfigProvider(env = process.env, options = {}) {
+  const fetchImpl = options.fetchImpl || globalThis.fetch;
+  const now = options.now || Date.now;
+  const cacheMs = options.cacheMs ?? METERED_CACHE_MS;
+  const retryMs = options.retryMs ?? METERED_RETRY_MS;
+
+  const app = (env.METERED_APP || '')
+    .trim()
+    .replace(/\.metered\.live$/i, '')
+    .toLowerCase();
+  const apiKey = (env.METERED_API_KEY || '').trim();
+  const meteredEnabled = /^[a-z0-9-]+$/.test(app) && apiKey.length > 0;
+
+  let cache = null; // { servers, at }
+  let retryAfter = 0;
+  let inflight = null;
+
+  async function refresh() {
+    try {
+      const url = `https://${app}.metered.live/api/v1/turn/credentials?apiKey=${encodeURIComponent(apiKey)}`;
+      const res = await fetchImpl(url, { signal: AbortSignal.timeout(METERED_TIMEOUT_MS) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const servers = sanitizeIceServers(await res.json());
+      if (servers.length === 0) throw new Error('response had no usable ICE servers');
+      cache = { servers, at: now() };
+    } catch (err) {
+      retryAfter = now() + retryMs;
+      // Message only: the request URL contains the API key and must never be logged
+      console.warn(`[ice-config] Could not refresh Metered credentials: ${err.message}`);
+    }
+  }
+
+  return async function getIceConfig() {
+    const config = buildIceConfig(env, now());
+    if (!meteredEnabled) return config;
+
+    const stale = !cache || now() - cache.at > cacheMs;
+    if (stale && now() >= retryAfter) {
+      inflight = inflight || refresh().finally(() => (inflight = null));
+      await inflight;
+    }
+    return cache ? { iceServers: [...config.iceServers, ...cache.servers] } : config;
+  };
+}
+
+/**
  * Resolves a request pathname to a servable file, or null.
  * Only public/ (with a containment check) and the ROOT_SCRIPTS allowlist are reachable.
  * @param {string} pathname URL pathname (still percent-encoded)
@@ -184,7 +320,7 @@ function resolveStaticFile(pathname) {
 /**
  * Serves the web app, /health and /ice-config. Nothing here touches signaling or payload data.
  */
-function handleHttpRequest(req, res, rooms) {
+function handleHttpRequest(req, res, rooms, getIceConfig, guard) {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' });
     res.end('Method Not Allowed');
@@ -202,8 +338,23 @@ function handleHttpRequest(req, res, rooms) {
   }
 
   if (pathname === '/ice-config') {
-    res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(buildIceConfig()));
+    // TURN logins are only handed to someone who names a room that currently exists, so a plain
+    // request (a scraper, curl) gets STUN only. Looking up rooms that do not exist is counted and
+    // capped: otherwise this endpoint would let anyone probe for live room codes.
+    const code = (parsedUrl.searchParams.get('room') || '').trim().toUpperCase();
+    const known = code.length > 0 && rooms.has(code);
+    if (!known && guard && !guard.allowMiss()) {
+      res.writeHead(429, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' });
+      res.end('Too Many Requests');
+      return;
+    }
+    const config = known
+      ? getIceConfig().catch(() => buildIceConfig())
+      : Promise.resolve(buildIceConfig({ STUN_URLS: process.env.STUN_URLS }));
+    config.then((body) => {
+      res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    });
     return;
   }
 
@@ -234,15 +385,36 @@ function handleHttpRequest(req, res, rooms) {
  * @param {number} [options.port] Optional port
  * @param {number} [options.heartbeatInterval] Heartbeat interval in ms
  * @param {number} [options.maxRooms] Cap on simultaneous rooms
+ * @param {Function} [options.iceConfigProvider] Async function returning the /ice-config payload
+ * @param {object} [options.limits] Overrides for resolveLimits() (tests, tuning)
  * @returns {{ server: http.Server, wss: WebSocketServer, rooms: Map<string, Set<WebSocket>>, close: Function }}
  */
 function createSignalingServer(options = {}) {
   // Ephemeral room registry: roomCode -> Set<WebSocket> (max 2 peers)
   const rooms = new Map();
-  const maxRooms = options.maxRooms || MAX_ROOMS;
+  const limits = resolveLimits(process.env, {
+    ...(options.maxRooms ? { maxRooms: options.maxRooms } : {}),
+    ...(options.limits || {})
+  });
+  const maxRooms = limits.maxRooms;
+  const connectionsPerIp = new Map(); // ip -> open sockets
+  const roomCreations = new Map(); // ip -> { windowStart, count }
+  let warnedAboutProxy = false;
 
+  const getIceConfig = options.iceConfigProvider || createIceConfigProvider();
+  // Lookups of unknown rooms through /ice-config, counted over a sliding minute
+  const iceMisses = [];
+  const iceGuard = {
+    allowMiss() {
+      const now = Date.now();
+      while (iceMisses.length > 0 && now - iceMisses[0] > 60000) iceMisses.shift();
+      if (iceMisses.length >= limits.maxIceMissesPerMinute) return false;
+      iceMisses.push(now);
+      return true;
+    }
+  };
   const requestHandler = (req, res) => {
-    handleHttpRequest(req, res, rooms);
+    handleHttpRequest(req, res, rooms, getIceConfig, iceGuard);
   };
   const server =
     options.server ||
@@ -286,15 +458,68 @@ function createSignalingServer(options = {}) {
     room.clear();
   }
 
-  wss.on('connection', (ws) => {
+  function rejectSocket(ws, code, reason) {
+    try {
+      ws.close(code, reason);
+    } catch {
+      ws.terminate();
+    }
+  }
+
+  wss.on('connection', (ws, req) => {
     ws.isAlive = true;
     ws.roomCode = null;
+    ws.failedJoins = 0;
+    ws.messageWindowStart = Date.now();
+    ws.messageCount = 0;
+
+    // Global and per-address connection caps
+    if (wss.clients.size > limits.maxConnections) {
+      rejectSocket(ws, 1013, 'Server is busy, try again later');
+      return;
+    }
+    const ip = clientIp(req, limits.trustProxyHops);
+    ws.limitKey = ip;
+    if (ip === null && req.headers['x-forwarded-for'] && !warnedAboutProxy) {
+      warnedAboutProxy = true;
+      const entries = String(req.headers['x-forwarded-for']).split(',').length;
+      console.warn(
+        `[limits] Requests arrive through a proxy (X-Forwarded-For has ${entries} entries) but ` +
+          'TRUST_PROXY_HOPS is not set, so per-address limits are off. Set TRUST_PROXY_HOPS to the ' +
+          'number of proxies in front of this server to enable them.'
+      );
+    }
+    if (ip !== null) {
+      const open = (connectionsPerIp.get(ip) || 0) + 1;
+      connectionsPerIp.set(ip, open);
+      // Registered before any rejection so a refused socket still gives its slot back
+      ws.on('close', () => {
+        const remaining = (connectionsPerIp.get(ip) || 1) - 1;
+        if (remaining <= 0) connectionsPerIp.delete(ip);
+        else connectionsPerIp.set(ip, remaining);
+      });
+      if (open > limits.maxConnectionsPerIp) {
+        rejectSocket(ws, 1008, 'Too many connections from this address');
+        return;
+      }
+    }
 
     ws.on('pong', () => {
       ws.isAlive = true;
     });
 
     ws.on('message', (rawBuffer, isBinary) => {
+      // Per-connection flood control: signaling is a handful of messages per session
+      const now = Date.now();
+      if (now - ws.messageWindowStart > 10000) {
+        ws.messageWindowStart = now;
+        ws.messageCount = 0;
+      }
+      if (++ws.messageCount > limits.maxMessagesPerWindow) {
+        rejectSocket(ws, 1008, 'Too many messages');
+        return;
+      }
+
       let parsed;
       try {
         parsed = JSON.parse(rawBuffer.toString());
@@ -322,8 +547,19 @@ function createSignalingServer(options = {}) {
           return;
         }
 
+        if (ws.limitKey) {
+          const entry = roomCreations.get(ws.limitKey);
+          if (!entry || now - entry.windowStart > 60000) {
+            roomCreations.set(ws.limitKey, { windowStart: now, count: 1 });
+          } else if (++entry.count > limits.maxRoomsPerIpPerMinute) {
+            sendJSON(ws, { type: 'error', message: 'Too many rooms created, wait a minute' });
+            return;
+          }
+        }
+
         const roomCode = generateRoomCode(rooms);
         const room = new Set([ws]);
+        room.createdAt = now;
         rooms.set(roomCode, room);
         ws.roomCode = roomCode;
 
@@ -349,6 +585,11 @@ function createSignalingServer(options = {}) {
 
         const room = rooms.get(requestedCode);
         if (!room) {
+          // Guessing codes is the only way to find someone else's room, so cap the misses
+          if (++ws.failedJoins >= limits.maxFailedJoins) {
+            rejectSocket(ws, 1008, 'Too many failed attempts');
+            return;
+          }
           sendJSON(ws, { type: 'error', message: 'Room not found or expired' });
           return;
         }
@@ -404,6 +645,13 @@ function createSignalingServer(options = {}) {
         return;
       }
 
+      // 5. Keepalive. Clients send this while waiting so that hosts which put idle services to
+      // sleep (they count incoming WebSocket messages as activity) keep the room alive.
+      if (type === 'ping') {
+        sendJSON(ws, { type: 'pong' });
+        return;
+      }
+
       // Unknown Type
       sendJSON(ws, { type: 'error', message: `Unsupported message type: ${type}` });
     });
@@ -420,6 +668,26 @@ function createSignalingServer(options = {}) {
   // Heartbeat interval to detect stale/dead TCP sockets
   const heartbeatInterval = options.heartbeatInterval || HEARTBEAT_INTERVAL_MS;
   const heartbeatTimer = setInterval(() => {
+    // Rooms are meant to live for minutes. Anything older is abandoned or abusive, so free it.
+    const now = Date.now();
+    for (const [code, room] of rooms) {
+      if (now - (room.createdAt || now) > limits.roomMaxAgeMs) {
+        for (const peer of room) {
+          sendJSON(peer, { type: 'error', message: 'Room not found or expired' });
+        }
+        const [first] = room;
+        if (first) {
+          for (const peer of [...room]) rejectSocket(peer, 1000, 'Room expired');
+          handlePeerDisconnect(first);
+        } else {
+          rooms.delete(code);
+        }
+      }
+    }
+    for (const [ip, entry] of roomCreations) {
+      if (now - entry.windowStart > 60000) roomCreations.delete(ip);
+    }
+
     for (const ws of wss.clients) {
       if (ws.isAlive === false) {
         handlePeerDisconnect(ws);
@@ -486,7 +754,11 @@ if (require.main === module) {
 module.exports = {
   createSignalingServer,
   buildIceConfig,
+  createIceConfigProvider,
+  sanitizeIceServers,
   resolveStaticFile,
+  resolveLimits,
+  clientIp,
   generateRoomCode,
   ROOM_CODE_LENGTH,
   ROOM_CODE_CHARS,

@@ -95,6 +95,25 @@ class WebRTCManager {
   constructor(options = {}) {
     this.wsUrl = options.wsUrl || this._getDefaultWsUrl();
     this.rtcConfig = options.rtcConfig || null;
+    this._fixedRtcConfig = Boolean(options.rtcConfig);
+
+    // Hosting on free tiers means the signaling server may be asleep. Keep trying for a while and
+    // tell the user why it is slow. Times are in ms and overridable for tests.
+    this.signalingRetry = {
+      slowAfterMs: 3000,
+      deadlineMs: 90000,
+      delaysMs: [1000, 2000, 3000, 5000],
+      ...(options.signalingRetry || {})
+    };
+    // While waiting for the peer, send a small message now and then. Hosts that put idle services
+    // to sleep count incoming WebSocket messages as activity.
+    this.keepAliveMs = options.keepAliveMs ?? 25000;
+    // A brief network blip (ICE "disconnected") often heals by itself. Wait this long before giving up.
+    this.reconnectGraceMs = options.reconnectGraceMs ?? 20000;
+
+    this._keepAliveTimer = null;
+    this._graceTimer = null;
+    this._epoch = 0; // bumped on reset so a stale connection attempt stops quietly
     this.ws = null;
     this.pc = null;
     this.dataChannel = null;
@@ -127,6 +146,8 @@ class WebRTCManager {
     this.onFileProgress = options.onFileProgress || (() => {});
     this.onFileComplete = options.onFileComplete || (() => {});
     this.onBackpressureChange = options.onBackpressureChange || (() => {});
+    this.onSignalingSlow = options.onSignalingSlow || (() => {});
+    this.onConnectionStatus = options.onConnectionStatus || (() => {});
     this.onError = options.onError || (() => {});
   }
 
@@ -145,12 +166,15 @@ class WebRTCManager {
 
   /**
    * ICE servers come from the server's /ice-config so TURN can be added without a client change.
-   * Falls back to public STUN if the endpoint is unavailable.
+   * The room code is sent along because the server only hands out TURN logins to people who are
+   * in a real room. Falls back to public STUN if the endpoint is unavailable.
    */
-  async _loadRtcConfig() {
-    if (this.rtcConfig) return;
+  async _loadRtcConfig(roomCode) {
+    if (this._fixedRtcConfig) return;
     try {
-      const res = await fetch('/ice-config', { cache: 'no-store' });
+      const res = await fetch(`/ice-config?room=${encodeURIComponent(roomCode || '')}`, {
+        cache: 'no-store'
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const config = await res.json();
       if (!config || !Array.isArray(config.iceServers) || config.iceServers.length === 0) {
@@ -164,15 +188,53 @@ class WebRTCManager {
   }
 
   /**
-   * Connect to WebSocket Signaling Server
+   * Connect to the WebSocket signaling server, retrying while it wakes up.
+   * Resolves once connected. Rejects (after reporting an error) when the deadline passes.
    */
   connectSignaling() {
-    return new Promise((resolve, reject) => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        resolve();
-        return;
-      }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return Promise.resolve();
 
+    const { slowAfterMs, deadlineMs, delaysMs } = this.signalingRetry;
+    const epoch = this._epoch;
+    const started = Date.now();
+    let attempt = 0;
+
+    return new Promise((resolve, reject) => {
+      const slowTimer = setTimeout(() => {
+        if (epoch === this._epoch) this.onSignalingSlow();
+      }, slowAfterMs);
+      const settle = (fn, arg) => {
+        clearTimeout(slowTimer);
+        fn(arg);
+      };
+
+      const tryOnce = () => {
+        this._openSocket().then(
+          () => settle(resolve),
+          (err) => {
+            const delay = delaysMs[Math.min(attempt++, delaysMs.length - 1)];
+            const outOfTime = Date.now() - started + delay > deadlineMs;
+            if (epoch !== this._epoch) {
+              settle(reject, err); // reset or disconnected meanwhile: stop without reporting
+            } else if (outOfTime) {
+              this._reportError('Could not reach the signaling server');
+              settle(reject, err);
+            } else {
+              this.onSignalingSlow();
+              setTimeout(tryOnce, delay);
+            }
+          }
+        );
+      };
+      tryOnce();
+    });
+  }
+
+  /**
+   * One connection attempt. Rejects if the socket errors or closes before it opened.
+   */
+  _openSocket() {
+    return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.wsUrl);
       this.ws = ws;
       let opened = false;
@@ -180,17 +242,24 @@ class WebRTCManager {
       ws.onopen = () => {
         opened = true;
         this.onStateChange('SIGNALING_CONNECTED');
+        this._startKeepAlive(ws);
         resolve();
       };
 
       ws.onerror = (err) => {
         if (!opened) {
-          this._reportError('Could not reach the signaling server');
+          if (this.ws === ws) this.ws = null;
           reject(err);
         }
       };
 
       ws.onclose = () => {
+        if (!opened) {
+          if (this.ws === ws) this.ws = null;
+          reject(new Error('Signaling socket closed before opening'));
+          return;
+        }
+        this._stopKeepAlive();
         if (this.ws !== ws) return;
         this.ws = null;
         this.onStateChange('SIGNALING_DISCONNECTED');
@@ -227,13 +296,27 @@ class WebRTCManager {
     });
   }
 
+  _startKeepAlive(ws) {
+    this._stopKeepAlive();
+    if (!(this.keepAliveMs > 0)) return;
+    this._keepAliveTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN && !this.peerConnected) {
+        ws.send('{"type":"ping"}');
+      }
+    }, this.keepAliveMs);
+  }
+
+  _stopKeepAlive() {
+    clearInterval(this._keepAliveTimer);
+    this._keepAliveTimer = null;
+  }
+
   /**
    * Create a new 6-character room. The AES key is generated here and never leaves this browser
    * except inside the share link fragment.
    */
   async createRoom() {
     this._resetSession();
-    await this._loadRtcConfig();
     this.cryptoKey = await generateAESKey();
     this.keyBase64Url = await keyToBase64Url(this.cryptoKey);
     await this.connectSignaling();
@@ -257,7 +340,6 @@ class WebRTCManager {
       return;
     }
     this.keyBase64Url = keyBase64Url;
-    await this._loadRtcConfig();
     await this.connectSignaling();
     this.isInitiator = false;
     const cleanCode = (code || '').trim().toUpperCase();
@@ -272,11 +354,14 @@ class WebRTCManager {
       case 'created':
         this.roomCode = msg.roomCode;
         this.onRoomCreated(msg.roomCode);
+        // Messages are handled in order, so the config is ready before any peer-joined arrives
+        await this._loadRtcConfig(msg.roomCode);
         break;
 
       case 'joined':
         this.roomCode = msg.roomCode;
         this.onJoined(msg.roomCode);
+        await this._loadRtcConfig(msg.roomCode);
         this._initPeerConnection();
         break;
 
@@ -301,6 +386,9 @@ class WebRTCManager {
 
       case 'ice-candidate':
         await this._handleRemoteCandidate(msg.candidate);
+        break;
+
+      case 'pong':
         break;
 
       case 'error':
@@ -334,7 +422,12 @@ class WebRTCManager {
       if (this.pc !== pc) return;
       const state = pc.iceConnectionState;
       this.onStateChange(`ICE_${state.toUpperCase()}`);
-      if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+      if (state === 'disconnected') {
+        this._beginReconnectGrace();
+      } else if (state === 'connected' || state === 'completed') {
+        this._endReconnectGrace(true);
+      } else if (state === 'failed' || state === 'closed') {
+        this._endReconnectGrace(false);
         this._handleConnectionLost(`Peer connection ${state}`);
       }
     });
@@ -431,8 +524,11 @@ class WebRTCManager {
     };
 
     dc.onerror = (err) => {
+      // After the last file is confirmed (or after a failure was already reported) the other side
+      // closes the channel on purpose, which browsers surface as an error event. Not worth a log.
+      if (this._finished || this._failed) return;
       console.error('DataChannel error:', err);
-      if (!this._finished) this._reportError('Data channel connection error');
+      this._reportError('Data channel connection error');
     };
 
     // Every frame goes through one queue so the (async) header decryption finishes before the
@@ -621,6 +717,7 @@ class WebRTCManager {
     this.fileSender = new WebRTCFileSender(this.dataChannel, {
       worker: this.worker,
       peerConnection: this.pc,
+      tolerateDisconnect: true, // the manager owns the reconnect grace period
       onProgress: (p) => {
         const queue = this._sendQueue;
         const file = queue.files[queue.index];
@@ -734,6 +831,27 @@ class WebRTCManager {
   /**
    * The peer connection or data channel went away.
    */
+  /**
+   * ICE "disconnected" is often a short blip (Wi-Fi roaming, a congested mobile link) that recovers
+   * on its own. Wait for it instead of failing. Sending slows down by itself meanwhile: the data
+   * channel's buffer stops draining, so the sender's backpressure pauses reading.
+   */
+  _beginReconnectGrace() {
+    if (this._finished || this._failed || this._graceTimer) return;
+    this.onConnectionStatus('reconnecting');
+    this._graceTimer = setTimeout(() => {
+      this._graceTimer = null;
+      this._handleConnectionLost('Peer connection did not recover');
+    }, this.reconnectGraceMs);
+  }
+
+  _endReconnectGrace(recovered) {
+    if (!this._graceTimer) return;
+    clearTimeout(this._graceTimer);
+    this._graceTimer = null;
+    if (recovered) this.onConnectionStatus('connected');
+  }
+
   _handleConnectionLost(reason) {
     if (this._finished || this._failed) return;
     this._failed = true;
@@ -747,12 +865,17 @@ class WebRTCManager {
   }
 
   _closeSignaling() {
+    this._stopKeepAlive();
     if (this.ws) {
       const ws = this.ws;
       this.ws = null;
-      ws.onclose = null;
-      ws.onmessage = null;
-      ws.onerror = null;
+      // Only detach handlers from a socket that finished opening. One that is still connecting
+      // must be able to fail, or the pending connect attempt would never settle.
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.onclose = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+      }
       try {
         ws.close();
       } catch {}
@@ -760,6 +883,8 @@ class WebRTCManager {
   }
 
   _teardownP2P() {
+    clearTimeout(this._graceTimer);
+    this._graceTimer = null;
     if (this.worker) {
       this.worker.terminate();
       this.worker = null;
@@ -785,6 +910,7 @@ class WebRTCManager {
   }
 
   _resetSession() {
+    this._epoch++;
     this._teardownP2P();
     this._closeSignaling();
     this._signalingQueue = Promise.resolve();
@@ -805,6 +931,7 @@ class WebRTCManager {
    * Complete teardown and disconnect. Closing is deliberate, so it is not reported as an error.
    */
   disconnect() {
+    this._epoch++;
     this._finished = true;
     this._teardownP2P();
     this._closeSignaling();
@@ -817,7 +944,7 @@ class WebRTCManager {
 
 // Pure helpers are exported for Node tests; the class itself needs browser APIs.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { sanitizeFileName, validateFileHeader };
+  module.exports = { sanitizeFileName, validateFileHeader, WebRTCManager };
 }
 
 // Global attachment

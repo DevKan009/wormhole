@@ -19,6 +19,7 @@
      * @param {object} [options]
      * @param {Worker} [options.worker] Web Worker instance running fileWorker.js
      * @param {RTCPeerConnection} [options.peerConnection] RTCPeerConnection for ICE lifecycle monitoring
+     * @param {boolean} [options.tolerateDisconnect] Do not treat ICE "disconnected" as fatal (it may recover)
      * @param {number} [options.highWatermark] Buffer bytes threshold to pause (default: 1,048,576 / 1MB)
      * @param {number} [options.lowWatermark] Buffer bytes threshold to resume (default: 262,144 / 256KB)
      * @param {Function} [options.onProgress] Callback ({ bytesSent, chunksSent, chunkIndex, isLast, totalChunks, bufferedAmount, isPaused })
@@ -34,6 +35,7 @@
       this.dataChannel = dataChannel;
       this.peerConnection = options.peerConnection || null;
       this.worker = options.worker || null;
+      this.tolerateDisconnect = !!options.tolerateDisconnect;
       this.highWatermark =
         typeof options.highWatermark === 'number' ? options.highWatermark : BUFFER_HIGH_WATERMARK;
       this.lowWatermark =
@@ -105,6 +107,8 @@
 
       const handleIceChange = () => {
         const state = this.peerConnection.iceConnectionState;
+        // "disconnected" can heal by itself. An owner that manages a grace period opts out here.
+        if (state === 'disconnected' && this.tolerateDisconnect) return;
         if (state === 'disconnected' || state === 'failed' || state === 'closed') {
           this._handleError(new Error(`RTCPeerConnection ICE state transitioned to "${state}"`));
         }

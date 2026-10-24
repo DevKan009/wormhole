@@ -158,6 +158,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const btnJoinRoom = $('btnJoinRoom');
   const btnJoinLabel = $('btnJoinLabel');
 
+  const noticeBox = $('noticeBox');
+  const noticeText = $('noticeText');
   const alertBox = $('alertBox');
   const alertText = $('alertText');
   const btnAlertAction = $('btnAlertAction');
@@ -197,7 +199,27 @@ document.addEventListener('DOMContentLoaded', () => {
   // Connection manager and its callbacks
   // -------------------------------------------------------------------------
   const rtcManager = new WebRTCManager({
+    onSignalingSlow: () => {
+      showNotice(
+        'Waking up the server. Free hosting sleeps when idle, so this can take up to a minute. Hang tight.'
+      );
+    },
+
+    onConnectionStatus: (status) => {
+      if (!xfer || currentPhase !== 'transferring') return;
+      if (status === 'reconnecting') {
+        setBadge('Reconnecting…', 'warning');
+        transferNote.hidden = false;
+        transferNote.textContent =
+          'The connection was interrupted. Keep this tab open and the transfer will continue if it comes back.';
+      } else {
+        setBadge(xfer.isReceiver ? 'Receiving' : 'Sending', 'info');
+        refreshTransferNote();
+      }
+    },
+
     onRoomCreated: (code) => {
+      hideNotice();
       senderRoomCode.textContent = code;
       shareLinkInput.value = shareLink() || '';
       shareCard.hidden = false;
@@ -205,6 +227,7 @@ document.addEventListener('DOMContentLoaded', () => {
     },
 
     onJoined: () => {
+      hideNotice();
       setHint('Joined. Opening a secure channel…', 'ok');
       btnJoinLabel.textContent = 'Connecting…';
     },
@@ -239,6 +262,7 @@ document.addEventListener('DOMContentLoaded', () => {
       setBadge(info.isReceiver ? 'Receiving' : 'Sending', 'info');
       transferStatusText.textContent = info.isReceiver ? 'Receiving' : 'Sending';
       showTransferPanel();
+      acquireWakeLock();
       renderTransferNow();
     },
 
@@ -294,7 +318,39 @@ document.addEventListener('DOMContentLoaded', () => {
     return currentPhase;
   }
 
+  function showNotice(message) {
+    noticeText.textContent = message;
+    noticeBox.hidden = false;
+  }
+
+  function hideNotice() {
+    noticeBox.hidden = true;
+    noticeText.textContent = '';
+  }
+
+  // Keep the screen on while transferring: a phone that sleeps or backgrounds the tab drops the
+  // connection. The lock is released by the browser when the tab is hidden, so take it again on return.
+  let wakeLock = null;
+  async function acquireWakeLock() {
+    if (wakeLock || !('wakeLock' in navigator)) return;
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => (wakeLock = null));
+    } catch {
+      wakeLock = null; // denied, for example in low-power mode: the transfer still works
+    }
+  }
+  function releaseWakeLock() {
+    if (wakeLock) wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && currentPhase === 'transferring')
+      acquireWakeLock();
+  });
+
   function showAlert(message, { action = true } = {}) {
+    hideNotice();
     alertText.textContent = friendlyError(message);
     btnAlertAction.hidden = !action;
     alertBox.hidden = false;
@@ -315,6 +371,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function markFailed() {
     if (currentPhase === 'done' || currentPhase === 'failed') return;
     currentPhase = 'failed';
+    releaseWakeLock();
     cancelDisconnect();
     if (xfer) {
       for (const row of xfer.files) {
@@ -616,11 +673,7 @@ document.addEventListener('DOMContentLoaded', () => {
     currentPhase = 'transferring';
     transferTitle.textContent = info.isReceiver ? 'Receiving' : 'Sending';
     transferSubtitle.textContent = `${plural(count, 'file')} · ${formatBytes(info.totalBytes)}`;
-    transferNote.hidden = !(info.isReceiver && count > 1);
-    transferNote.textContent =
-      info.isReceiver && count > 1
-        ? 'Your browser may ask for permission to download multiple files. Allow it to keep going.'
-        : '';
+    refreshTransferNote();
     transferActions.hidden = true;
     buildTransferRows();
   }
@@ -742,7 +795,20 @@ document.addEventListener('DOMContentLoaded', () => {
     transferStatusText.textContent = text;
   }
 
+  /** Reminder shown for the whole transfer. Closing or backgrounding the tab drops the connection. */
+  function refreshTransferNote() {
+    if (!xfer) return;
+    let text = 'Keep this tab open and your screen on until it finishes.';
+    if (xfer.isReceiver && xfer.count > 1) {
+      text +=
+        ' Your browser may ask permission to download multiple files. Allow it to keep going.';
+    }
+    transferNote.textContent = text;
+    transferNote.hidden = false;
+  }
+
   function finishTransfer(isReceiver) {
+    releaseWakeLock();
     currentPhase = 'done';
     setBadge('Complete', 'success');
     transferTitle.textContent = isReceiver ? 'Received' : 'Sent';
@@ -783,6 +849,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // Reset
   // -------------------------------------------------------------------------
   function fullReset() {
+    releaseWakeLock();
+    hideNotice();
     cancelDisconnect();
     rtcManager.disconnect();
     files = [];
