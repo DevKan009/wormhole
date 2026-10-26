@@ -14,7 +14,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const { createSignalingServer } = require('../server');
 
-const SUITES = ['transfer.js', 'ui.js', 'speed.js', 'wakeup.js'];
+const SUITES = ['transfer.js', 'ui.js', 'speed.js', 'devtab.js', 'multi.js', 'wakeup.js'];
 
 function runSuite(file, env) {
   return new Promise((resolve) => {

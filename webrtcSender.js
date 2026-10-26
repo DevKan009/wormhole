@@ -49,6 +49,8 @@
 
       // Event hooks
       this.onProgress = options.onProgress || null;
+      this.onChunk = options.onChunk || null; // every encrypted chunk, for the Developers tab
+      this.fileIndex = 0;
       this.onComplete = options.onComplete || null;
       this.onError = options.onError || null;
       this.onBackpressureChange = options.onBackpressureChange || null;
@@ -222,6 +224,15 @@
           ? Math.min(fileSize, (chunkIndex + 1) * 65536)
           : this.bytesSent;
 
+      if (typeof this.onChunk === 'function') {
+        this.onChunk({
+          fileIndex: this.fileIndex,
+          chunkIndex,
+          totalChunks,
+          cipher: encryptedChunk
+        });
+      }
+
       if (typeof this.onProgress === 'function') {
         this.onProgress({
           fileBytesQueued,
@@ -268,6 +279,7 @@
       }
 
       this.isTransferring = true;
+      this.fileIndex = fileIndex;
       this.bytesSent = 0;
       this.chunksSent = 0;
       this.isWorkerPaused = false;

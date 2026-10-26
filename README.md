@@ -38,10 +38,26 @@
 ### 4. 🗄️ Zero-Retention WebSocket Signaling
 
 - **6-Character Room Codes**: Cryptographically secure, collision-free alphanumeric codes (`[A-Z0-9]{6}`).
-- **Strict 2-Peer Scope**: Rooms are limited to exactly 2 peers; third-party join requests are rejected.
+- **Room Size**: A room has one sender and one to eight receivers, chosen by the sender when the room is created (default one). Receivers are numbered by the server, can only talk to the sender (never to each other), and a slot is not freed when someone leaves, so a stranger cannot take it. The sender can lock the room early.
 - **Blind Relay**: The server only inspects the `type` property (`offer`, `answer`, `ice-candidate`) and never logs, reads, or stores SDPs or candidates.
-- **Instant Teardown**: The moment one peer disconnects or encounters an error, the room is deleted from server memory and the remaining peer is disconnected. Both browsers leave the room as soon as the data channel opens, so the link stops working once the peers are connected.
+- **Instant Teardown**: When the sender leaves, or either side of a one-receiver room leaves, the room is deleted from server memory and everyone else is disconnected. In a room for several receivers, one receiver leaving (they all do, as soon as their data channel opens) only tells the sender, and the room lives until the sender leaves. Nothing is retained.
 - **Locked-Down Static Hosting**: Only `public/` and the five shared browser scripts are served. `.git`, `server.js`, `package.json` and everything else return 404. Responses carry a strict CSP, `Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
+
+### 5. 🔍 Developers tab
+
+The **Developers** button in the top navigation opens a live view of what this browser is doing, built from the real events of the connection (nothing is simulated and nothing is sent anywhere). Open it on both the sending and the receiving side to see both halves. It shows:
+
+- **Steps**: a checklist from "room key ready" to "receiver confirms each file", each with its time.
+- **SDP**: this side's and the other side's session description, parsed (data channel port, max message size, DTLS fingerprint and role). The ICE password is never displayed.
+- **ICE candidates**: every candidate found by either side (host, srflx, relay), plus which STUN/TURN servers were configured (TURN logins are never shown).
+- **Selected network path**: the chosen address pair, whether it is direct or relayed, round trip, bytes moved, read once a second from `getStats()`.
+- **Transport security**: the DTLS version and cipher suite, and the data channel's settings.
+- **Encryption done by the app**: the key fingerprint (it matches on both sides), the file header encryption, and sampled per-chunk rows with the real nonce, sizes, first ciphertext bytes and decrypt time.
+- **Flow control and speed**: pause/resume events and a throughput graph.
+- **What the server can see**: what was sent to the server, with a check made on every real outgoing message that the key was in none of them.
+- **Event log** with filters, pause, clear and **Copy as JSON**.
+
+The key is hidden unless you tick **Show key (demo only)**, because it is the secret. **Mask IP addresses** hides the host part of addresses for screen sharing. The recorder keeps at most 600 events and samples chunk rows (first three, every 64th, last), so it costs almost nothing during a fast transfer.
 
 ---
 
@@ -105,7 +121,10 @@
 │   ├── index.html                # Semantic, accessible markup (tabs, landmarks, SVG icon sprite)
 │   ├── style.css                 # Design tokens, light/dark themes, components, reduced motion
 │   ├── app.js                    # UI state, transfer list, speed/ETA, QR rendering
+│   ├── inspector.js              # In-page recorder behind the Developers tab (events, SDP/stats parsing, key scrubbing)
+│   ├── devtab.js                 # Developers tab: top navigation and the live panels
 │   ├── webrtcManager.js          # WebRTC P2P client coordinator, multi-file protocol
+│   ├── senderHub.js              # Sending to up to 8 receivers: one connection each, encrypt once, slowest sets the pace
 │   ├── favicon.svg               # App icon
 │   └── vendor/qrcode.js          # QR encoder (qrcode-generator, MIT), vendored; no CDN
 ├── test.js                       # Signaling server integration tests
@@ -113,6 +132,9 @@
 ├── test-crypto.js                # AES-GCM 256-bit cryptographic unit tests
 ├── test-webrtc-backpressure.js   # WebRTC backpressure flow control tests
 ├── test-resilience.js            # Metered TURN, server limits, client retry/keepalive/reconnect tests
+├── test-inspector.js             # Developers tab recorder: parsing, masking, sampling, key scrubbing
+├── test-multipeer.js             # Signaling for one sender and several receivers (slots, addressing, locking)
+├── test-hub.js                   # SenderHub against mock connections (fan-out, pace, confirmations, failures)
 ├── render.yaml                   # Render Blueprint (free web service)
 ├── test-protocol.js              # Key transport, headers, receiver validation, sinks, server hardening tests
 ├── e2e/                          # Real-browser suites (Playwright + axe): transfers, failures, accessibility
@@ -153,6 +175,8 @@ The server will start at **`http://localhost:8080`** (or your custom `PORT` envi
 5. The receiver opens the link (or pastes it into the Receive tab) and presses **Connect and download**. The browsers connect directly and the files are decrypted, verified and downloaded one after another.
 
 The room and link are single-use. A room carries one batch of files.
+
+**Sending to several people.** Before choosing files, set **Send to** to 2–8 people. You still get one link and one key. Each person who opens it takes a place and gets their own direct connection from your browser, and sending starts by itself when everyone is there (or press **Start with who is here**). Each file is read and encrypted once and the same encrypted chunks go to every receiver, so only your upload grows with the number of people: sending to four people on a 10 Mbps uplink gives each about 2.5 Mbps. The slowest receiver sets the pace, a receiver whose connection stalls for 20 seconds is dropped, and one receiver dropping out never stops the others. The link has no per-person identity: whoever opens it first takes a place, so share it only with the people you mean. Receivers that need the relay each use your relay quota.
 
 > **Known limitations**
 >
@@ -195,6 +219,8 @@ The room and link are single-use. A room carries one batch of files.
   | `MAX_MESSAGES_PER_10S`                               | 100     | Per connection. Flooding closes it                                  |
   | `MAX_FAILED_JOINS`                                   | 5       | Wrong room codes allowed per connection (stops code guessing)       |
   | `MAX_ICE_MISSES_PER_MIN`                             | 60      | `/ice-config` lookups of rooms that do not exist, all clients       |
+  | `MAX_PEERS_PER_ROOM`                                 | 8       | Most receivers a sender may ask for in one room                     |
+  | `MAX_ROOM_RELAYS`                                    | 2000    | Signaling messages one room may relay (setup is a few dozen each)   |
   | `MAX_CONNECTIONS_PER_IP`, `MAX_ROOMS_PER_IP_PER_MIN` | 8, 10   | Per address. Only active when the address is trustworthy, see below |
   | `TRUST_PROXY_HOPS`                                   | unset   | How many reverse proxies sit in front of the server                 |
 
@@ -236,11 +262,16 @@ Set `E2E_SHOTS=./e2e-shots` to keep screenshots. The browser is launched with mD
 ### Test Coverage:
 
 - **`e2e/transfer.js`**: five files over a real WebRTC connection (2 MB, 300 KB, exactly two chunks, 70 MB through disk-backed storage, 0 bytes), each verified byte for byte with SHA-256; confirms the key never appears in a signaling message and is stripped from the address bar, and that the strict CSP produces no console errors.
+- **`e2e/devtab.js`**: the Developers tab during a real two-browser transfer. Every step and panel fills from real events, both sides show the same key fingerprint, the key is hidden unless asked for and never appears in a message to the server, IP masking works, and the tab passes an accessibility audit in light and dark.
+- **`e2e/multi.js`**: one sender and three receivers in real browsers: one link, every file byte for byte on every receiver (SHA-256), starting early with fewer people, a latecomer refused, one receiver closing their browser mid-transfer while the others finish, the Developers tab listing every connection, and accessibility audits of the new send screens.
 - **`e2e/speed.js`**: 40 small files, like a phone gallery. Every file must arrive in order and byte for byte, and the Speed figure must show during the transfer and stay as an average afterwards.
 - **`e2e/wakeup.js`**: the server goes away after the page loads and returns seconds later. The page explains the delay, keeps retrying, then creates the room and completes a transfer.
 - **`e2e/ui.js`**: axe accessibility audits of every screen in light and dark, keyboard tab navigation and focus ring, inline validation, wrong key, expired link, sender dropping mid-transfer, and reset.
+- **`test-inspector.js`**: the Developers tab recorder: candidate and SDP parsing, nonce layout (checked against the real cipher), chunk sampling, IP masking, key scrubbing, the bounded event buffer, and stats summaries (direct vs relayed).
 - **`test-resilience.js`**: Metered credential fetching (caching, back-off, stale-on-error, key never logged, host-injection guards), every server limit against a real WebSocket server (flood, code guessing, per-address and global caps, room creation rate, room expiry, proxy handling), and the client's retry, keepalive and reconnect-grace logic.
 - **`test-protocol.js`**: base64url key transport, share-link parsing, encrypted header (tamper and wrong-key rejection), header validation and file-name sanitising, multi-file nonce ranges and replay rejection, receiver rejection of reordered, truncated, oversize and tampered chunks, the static-file allowlist (`/.git/config`, `/server.js` → 404), ICE/TURN config, and security headers.
+- **`test-multipeer.js`**: signaling for one sender and several receivers against a real server: choosing 1–8 places, unique receiver ids, "room is full", addressed relaying stamped by the server (receivers cannot reach each other or forge the sender), a receiver leaving without ending the room, slots staying used, locking, the sender leaving, the per-room relay cap, and one-receiver rooms keeping their original behaviour.
+- **`test-hub.js`**: the multi-receiver sender against mock connections: one connection per receiver, encrypt-once fan-out (the same chunk object reaches everyone), pace set by the slowest receiver, files complete only when all remaining receivers confirm, receivers failing or leaving without stopping the rest, stall detection, reconnect grace per receiver, and the key never appearing in the recorder.
 - **`test.js`**: 6-character alphanumeric code generation, room join lifecycle, 2-peer enforcement, instant teardown on disconnect, and malformed payload handling.
 - **`test-chunker.js`**: Strict 65,536-byte chunk size verification, remainder handling, `FlowController` pause/resume, and zero-memory accumulation.
 - **`test-crypto.js`**: 96-bit big-endian deterministic nonces, AES-GCM 256-bit key export/import, 16-byte tag expansion (`65,536` $\rightarrow$ `65,552` bytes), ciphertext tamper detection, and round-trip decryption.

@@ -183,6 +183,7 @@
 
       this.onChunkReceived = options.onChunkReceived || null;
       this.onProgress = options.onProgress || null;
+      this.onChunk = options.onChunk || null; // every decrypted chunk, for the Developers tab
       this.onComplete = options.onComplete || null;
       this.onControl = options.onControl || null;
       this.onError = options.onError || null;
@@ -275,11 +276,21 @@
         }
       }
 
+      const startedAt = typeof performance !== 'undefined' ? performance.now() : 0;
       const decrypted = await decryptChunk(
         this.key,
         encryptedBuffer,
         nonceIndex(this.fileIndex, chunkIndex)
       );
+      if (typeof this.onChunk === 'function') {
+        this.onChunk({
+          fileIndex: this.fileIndex,
+          chunkIndex,
+          totalChunks: total,
+          cipher: encryptedBuffer,
+          ms: typeof performance !== 'undefined' ? performance.now() - startedAt : 0
+        });
+      }
 
       await this.sink.write(decrypted);
       this.bytesReceived += decrypted.byteLength;

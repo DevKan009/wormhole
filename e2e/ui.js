@@ -125,10 +125,13 @@ async function startSender(sender, files) {
       'Home returns to Send tab',
       (await sender.getAttribute('#tabSend', 'aria-selected')) === 'true'
     );
-    // Keyboard path into the file picker: the input inside the dropzone is focusable
+    // Keyboard path: first the "Send to" picker, then the file input inside the dropzone
+    await sender.keyboard.press('Tab');
+    const picker = await sender.evaluate(() => document.activeElement.id);
+    check('Tab from tablist reaches the recipient picker', picker === 'recipientCount', picker);
     await sender.keyboard.press('Tab');
     const focused = await sender.evaluate(() => document.activeElement.id);
-    check('Tab from tablist reaches the file input', focused === 'fileInput', focused);
+    check('Tab again reaches the file input', focused === 'fileInput', focused);
     const ring = await sender.evaluate(
       () => getComputedStyle(document.getElementById('dropZone')).outlineStyle
     );

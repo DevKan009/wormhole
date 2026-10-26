@@ -142,7 +142,17 @@ document.addEventListener('DOMContentLoaded', () => {
   const btnAddMore = $('btnAddMore');
   const btnClearFiles = $('btnClearFiles');
 
+  const recipientsRow = $('recipientsRow');
+  const recipientCount = $('recipientCount');
   const shareCard = $('shareCard');
+  const shareHelp = $('shareHelp');
+  const defaultShareHelp = shareHelp.textContent;
+  const peerSlots = $('peerSlots');
+  const peerSlotsSummary = $('peerSlotsSummary');
+  const peerSlotList = $('peerSlotList');
+  const btnStartNow = $('btnStartNow');
+  const peerTransfer = $('peerTransfer');
+  const peerTransferList = $('peerTransferList');
   const shareLinkInput = $('shareLinkInput');
   const btnCopyLink = $('btnCopyLink');
   const btnCopyLabel = $('btnCopyLabel');
@@ -198,7 +208,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // -------------------------------------------------------------------------
   // Connection manager and its callbacks
   // -------------------------------------------------------------------------
-  const rtcManager = new WebRTCManager({
+  // Callbacks shared by sending to one person (WebRTCManager) and to several (SenderHub)
+  const sharedHandlers = {
     onSignalingSlow: () => {
       showNotice(
         'Waking up the server. Free hosting sleeps when idle, so this can take up to a minute. Hang tight.'
@@ -215,32 +226,6 @@ document.addEventListener('DOMContentLoaded', () => {
       } else {
         setBadge(xfer.isReceiver ? 'Receiving' : 'Sending', 'info');
         refreshTransferNote();
-      }
-    },
-
-    onRoomCreated: (code) => {
-      hideNotice();
-      senderRoomCode.textContent = code;
-      shareLinkInput.value = shareLink() || '';
-      shareCard.hidden = false;
-      setWait('Waiting for the receiver to open the link…', true);
-    },
-
-    onJoined: () => {
-      hideNotice();
-      setHint('Joined. Opening a secure channel…', 'ok');
-      btnJoinLabel.textContent = 'Connecting…';
-    },
-
-    onPeerJoined: () => {
-      locked = true;
-      renderFileList();
-      setWait('Receiver connected. Opening a secure channel…', true);
-    },
-
-    onP2PConnected: () => {
-      if (rtcManager.isInitiator && files.length > 0) {
-        rtcManager.sendFiles(files).catch((err) => failWith(err.message));
       }
     },
 
@@ -307,10 +292,233 @@ document.addEventListener('DOMContentLoaded', () => {
     onError: (message) => {
       failWith(message);
     }
+  };
+
+  const rtcManager = new WebRTCManager({
+    ...sharedHandlers,
+
+    onRoomCreated: (code) => {
+      hideNotice();
+      senderRoomCode.textContent = code;
+      shareLinkInput.value = shareLink() || '';
+      shareCard.hidden = false;
+      setWait('Waiting for the receiver to open the link…', true);
+    },
+
+    onJoined: () => {
+      hideNotice();
+      setHint('Joined. Opening a secure channel…', 'ok');
+      btnJoinLabel.textContent = 'Connecting…';
+    },
+
+    onPeerJoined: () => {
+      locked = true;
+      renderFileList();
+      setWait('Receiver connected. Opening a secure channel…', true);
+    },
+
+    onP2PConnected: () => {
+      if (rtcManager.isInitiator && files.length > 0) {
+        rtcManager.sendFiles(files).catch((err) => failWith(err.message));
+      }
+    }
   });
 
+  // -------------------------------------------------------------------------
+  // Sending to several people: one link, one key, one direct connection per person
+  // -------------------------------------------------------------------------
+  let hub = null; // SenderHub, only when sending to more than one person
+  let hubMax = 1;
+  let hubStarted = false;
+  const peerRows = new Map(); // peerId -> { label, state, reconnecting, reason, path, rttMs, bytes, total }
+  const peerEls = new Map(); // peerId -> <li> in the transfer panel
+
+  const SLOT_TEXT = {
+    connecting: 'Connecting…',
+    connected: 'Connected',
+    sending: 'Sending',
+    done: 'Done',
+    failed: 'Failed'
+  };
+
+  function peerStateText(p) {
+    if (p.state === 'failed') return 'Failed';
+    if (p.reconnecting) return 'Reconnecting…';
+    return SLOT_TEXT[p.state] || '';
+  }
+
+  function connectedPeers() {
+    return [...peerRows.values()].filter((p) => p.state === 'connected').length;
+  }
+
+  function renderSlots() {
+    const frag = document.createDocumentFragment();
+    const peers = [...peerRows.values()];
+    for (let i = 0; i < hubMax; i++) {
+      const p = peers[i];
+      const li = document.createElement('li');
+      li.className = 'peer-slot';
+      li.dataset.state = p ? p.state : 'empty';
+      const name = document.createElement('span');
+      name.textContent = p ? p.label : `Place ${i + 1}`;
+      const state = document.createElement('span');
+      state.className = 'slot-state';
+      state.textContent = p ? peerStateText(p) : 'Waiting';
+      li.append(name, state);
+      frag.append(li);
+    }
+    peerSlotList.replaceChildren(frag);
+
+    const connected = connectedPeers();
+    const waitingForSlots = peers.length < hubMax;
+    peerSlotsSummary.textContent = hubStarted
+      ? ''
+      : `${connected} of ${hubMax} connected.${waitingForSlots ? ' Sending starts when everyone is here, or press Start.' : ''}`;
+    btnStartNow.disabled = hubStarted || connected < 1;
+    if (!hubStarted && phase() === 'waiting') {
+      setWait(
+        connected === 0
+          ? `Waiting for people to open the link. 0 of ${hubMax} connected.`
+          : `${connected} of ${hubMax} connected.`,
+        true
+      );
+    }
+  }
+
+  function startHubTransfer() {
+    if (!hub || hubStarted) return;
+    hubStarted = true;
+    btnStartNow.disabled = true;
+    renderSlots();
+    hub.sendFiles(files).catch((err) => failWith(err.message));
+  }
+
+  function createHub(count) {
+    hubMax = count;
+    hubStarted = false;
+    peerRows.clear();
+    hub = new SenderHub({
+      ...sharedHandlers,
+      maxPeers: count,
+
+      onRoomCreated: (code, max) => {
+        hideNotice();
+        hubMax = max || count;
+        senderRoomCode.textContent = code;
+        shareLinkInput.value = shareLink() || '';
+        shareHelp.textContent = `Send it to up to ${hubMax} people. Each one opens it in their own browser and gets their own direct connection. Whoever has the full link can take a place, and it stops working once all places are taken or you press Start. The part after # is the decryption key and never reaches our server.`;
+        peerSlots.hidden = false;
+        shareCard.hidden = false;
+        renderSlots();
+      },
+
+      onPeerJoined: (p) => {
+        locked = true;
+        renderFileList();
+        peerRows.set(p.peerId, {
+          label: p.label,
+          state: 'connecting',
+          reconnecting: false,
+          reason: null,
+          path: null,
+          rttMs: null,
+          bytes: 0,
+          total: 0
+        });
+        renderSlots();
+      },
+
+      onPeerState: (s) => {
+        const row = peerRows.get(s.peerId) || { bytes: 0, total: 0 };
+        peerRows.set(s.peerId, { ...row, ...s });
+        renderSlots();
+        if (xfer) scheduleRender();
+      },
+
+      onPeerProgress: (p) => {
+        const row = peerRows.get(p.peerId);
+        if (!row) return;
+        row.bytes = p.bytes;
+        row.total = p.totalBytes;
+        scheduleRender();
+      },
+
+      // Everyone expected is here (or has failed): go
+      onReady: () => startHubTransfer(),
+      // The server closed the room early. Nobody else can join, so carry on with who is here.
+      onRoomClosed: () => startHubTransfer()
+    });
+    return hub;
+  }
+
+  /** The sender's engine for this room: the hub when sending to several people. */
+  const engine = () => hub || rtcManager;
+
+  btnStartNow.addEventListener('click', () => startHubTransfer());
+
+  function renderPeerTransfer() {
+    if (!hub || peerRows.size === 0) {
+      peerTransfer.hidden = true;
+      return;
+    }
+    peerTransfer.hidden = false;
+    for (const [peerId, p] of peerRows) {
+      let li = peerEls.get(peerId);
+      if (!li) {
+        li = document.createElement('li');
+        li.className = 'xfer-row';
+        const glyph = document.createElement('span');
+        glyph.className = 'file-glyph';
+        const main = document.createElement('span');
+        main.className = 'file-main';
+        const name = document.createElement('span');
+        name.className = 'file-name';
+        const meta = document.createElement('span');
+        meta.className = 'file-meta';
+        main.append(name, meta);
+        const state = document.createElement('span');
+        state.className = 'xfer-state';
+        const bar = document.createElement('div');
+        bar.className = 'progress';
+        bar.setAttribute('role', 'progressbar');
+        bar.setAttribute('aria-valuemin', '0');
+        bar.setAttribute('aria-valuemax', '100');
+        const fill = document.createElement('div');
+        fill.className = 'progress-fill';
+        bar.appendChild(fill);
+        li.append(glyph, main, state, bar);
+        peerTransferList.appendChild(li);
+        peerEls.set(peerId, li);
+      }
+      const done = p.state === 'done';
+      const failed = p.state === 'failed';
+      const pct = done ? 100 : p.total > 0 ? Math.floor((p.bytes / p.total) * 100) : 0;
+      li.dataset.state = done ? 'done' : failed ? 'failed' : 'active';
+      const glyph = li.querySelector('.file-glyph');
+      glyph.textContent = '';
+      glyph.appendChild(iconEl(done ? 'check' : failed ? 'alert' : 'file'));
+      li.querySelector('.file-name').textContent = p.label;
+      li.querySelector('.file-meta').textContent = failed
+        ? p.reason || 'Dropped'
+        : p.path
+          ? `${p.path === 'direct' ? 'Direct' : 'Relayed'}${p.rttMs != null ? `, ${p.rttMs} ms` : ''}`
+          : 'Connected';
+      li.querySelector('.progress-fill').style.width = `${pct}%`;
+      const bar = li.querySelector('.progress');
+      bar.setAttribute('aria-valuenow', String(pct));
+      bar.setAttribute('aria-label', `${p.label} progress`);
+      li.querySelector('.xfer-state').textContent = done
+        ? 'Done'
+        : failed
+          ? 'Dropped'
+          : p.reconnecting
+            ? 'Reconnecting…'
+            : `${pct}%`;
+    }
+  }
+
   function shareLink() {
-    const fragment = rtcManager.getShareFragment();
+    const fragment = engine().getShareFragment();
     return fragment ? `${window.location.origin}/#${fragment}` : null;
   }
 
@@ -462,7 +670,10 @@ document.addEventListener('DOMContentLoaded', () => {
     hideAlert();
     currentPhase = 'waiting';
     qrRendered = false;
-    rtcManager.createRoom().catch((err) => {
+    const count = Number(recipientCount.value) || 1;
+    recipientCount.disabled = true;
+    const room = count > 1 ? createHub(count).createRoom(count) : rtcManager.createRoom();
+    room.catch((err) => {
       failWith(err && err.message ? err.message : 'Could not create a room');
     });
   }
@@ -470,6 +681,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function renderFileList() {
     const has = files.length > 0;
     dropZone.hidden = has;
+    recipientsRow.hidden = has;
     fileCard.hidden = !has;
     btnAddMore.hidden = locked;
     btnClearFiles.hidden = locked;
@@ -762,6 +974,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function renderTransferNow() {
     if (!xfer) return;
+    renderPeerTransfer();
     const total = xfer.totalBytes;
     const done = Math.min(total, overallBytes());
     const pct = total > 0 ? Math.floor((done / total) * 100) : phase() === 'done' ? 100 : 0;
@@ -835,14 +1048,23 @@ document.addEventListener('DOMContentLoaded', () => {
     transferTitle.textContent = isReceiver ? 'Received' : 'Sent';
     transferSubtitle.textContent = isReceiver
       ? `${plural(xfer.count, 'file')} verified and downloaded`
-      : `${plural(xfer.count, 'file')} delivered and verified`;
+      : hub
+        ? hubSummary()
+        : `${plural(xfer.count, 'file')} delivered and verified`;
     transferNote.hidden = true;
     btnTransferResetLabel.textContent = isReceiver ? 'Receive more' : 'Send more files';
     transferActions.hidden = false;
     btnTransferReset.focus();
     showToast(isReceiver ? 'Download started' : 'Delivered and verified', 'check');
     // The room is single-use. Give the final confirmation a moment to flush, then drop everything.
-    disconnectTimer = setTimeout(() => rtcManager.disconnect(), 1500);
+    disconnectTimer = setTimeout(() => engine().disconnect(), 1500);
+  }
+
+  function hubSummary() {
+    const all = [...peerRows.values()];
+    const done = all.filter((p) => p.state === 'done').length;
+    const dropped = all.filter((p) => p.state === 'failed').length;
+    return `${plural(xfer.count, 'file')} delivered and verified to ${done} of ${all.length} people${dropped ? `, ${dropped} dropped` : ''}`;
   }
 
   function cancelDisconnect() {
@@ -874,6 +1096,19 @@ document.addEventListener('DOMContentLoaded', () => {
     hideNotice();
     cancelDisconnect();
     rtcManager.disconnect();
+    if (hub) {
+      hub.disconnect();
+      hub = null;
+    }
+    hubStarted = false;
+    peerRows.clear();
+    peerEls.clear();
+    peerTransferList.textContent = '';
+    peerTransfer.hidden = true;
+    peerSlots.hidden = true;
+    peerSlotList.textContent = '';
+    shareHelp.textContent = defaultShareHelp;
+    recipientCount.disabled = !secureContext;
     files = [];
     locked = false;
     roomRequested = false;

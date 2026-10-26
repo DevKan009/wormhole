@@ -55,6 +55,11 @@
           <path d="M12 3l10 18H2z" />
           <path d="M12 10v4M12 17.5v.01" />
         </symbol>
+        <symbol id="i-code" viewBox="0 0 24 24">
+          <path d="M8 8l-5 4 5 4" />
+          <path d="M16 8l5 4-5 4" />
+          <path d="M14 5l-4 14" />
+        </symbol>
         <symbol id="i-info" viewBox="0 0 24 24">
           <circle cx="12" cy="12" r="9" />
           <path d="M12 11v5M12 7.5v.01" />
@@ -72,12 +77,24 @@
       </defs>
     </svg>
 
-    <div class="shell">
+    <div id="shell" class="shell">
       <header class="site-header">
-        <h1 class="wordmark">
-          <svg class="icon icon-lg" aria-hidden="true"><use href="#i-shield" /></svg>
-          <span>EphemeralShare</span>
-        </h1>
+        <div class="topbar">
+          <h1 class="wordmark">
+            <svg class="icon icon-lg" aria-hidden="true"><use href="#i-shield" /></svg>
+            <span>EphemeralShare</span>
+          </h1>
+          <nav class="topnav" aria-label="Main">
+            <button id="navTransfer" class="nav-link" type="button" aria-current="page">
+              <svg class="icon" aria-hidden="true"><use href="#i-upload" /></svg>
+              <span>Transfer</span>
+            </button>
+            <button id="navDevelopers" class="nav-link" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#i-code" /></svg>
+              <span>Developers</span>
+            </button>
+          </nav>
+        </div>
         <p class="lede">
           Send files straight to another browser. They're encrypted on your device and never stored
           on a server.
@@ -99,7 +116,7 @@
         <p id="noticeText" class="notice-text"></p>
       </div>
 
-      <main>
+      <main id="viewTransfer">
         <div id="modeCard" class="card">
           <div class="tabs" role="tablist" aria-label="Transfer mode">
             <button
@@ -129,6 +146,24 @@
 
           <!-- SEND -->
           <section id="viewSend" class="panel" role="tabpanel" aria-labelledby="tabSend">
+            <div id="recipientsRow" class="field recipients">
+              <label class="label" for="recipientCount">Send to</label>
+              <select id="recipientCount" class="input select">
+                <option value="1" selected>1 person</option>
+                <option value="2">2 people</option>
+                <option value="3">3 people</option>
+                <option value="4">4 people</option>
+                <option value="5">5 people</option>
+                <option value="6">6 people</option>
+                <option value="7">7 people</option>
+                <option value="8">8 people</option>
+              </select>
+              <p class="field-hint">
+                Everyone gets their own direct connection. Your upload is shared between them, so
+                more people means slower for each.
+              </p>
+            </div>
+
             <label id="dropZone" class="dropzone" for="fileInput">
               <input id="fileInput" class="visually-hidden" type="file" multiple />
               <span class="dropzone-icon">
@@ -180,11 +215,19 @@
                   <span id="btnCopyLabel">Copy link</span>
                 </button>
               </div>
-              <p class="help">
+              <p id="shareHelp" class="help">
                 Send it over any channel. Whoever has the full link can receive these files, and it
                 stops working as soon as someone connects. The part after # is the decryption key
                 and never reaches our server.
               </p>
+
+              <div id="peerSlots" class="peer-slots" hidden>
+                <p id="peerSlotsSummary" class="help"></p>
+                <ul id="peerSlotList" class="peer-slot-list" aria-label="People connecting"></ul>
+                <button id="btnStartNow" class="btn btn-secondary" type="button" disabled>
+                  Start with who is here
+                </button>
+              </div>
 
               <div class="share-footer">
                 <span class="code-label">
@@ -296,6 +339,11 @@
 
           <ul id="transferList" class="xfer-list" aria-label="Files in this transfer"></ul>
 
+          <div id="peerTransfer" class="stack" hidden>
+            <h3 class="dev-title">Receivers</h3>
+            <ul id="peerTransferList" class="xfer-list" aria-label="Receivers"></ul>
+          </div>
+
           <p id="transferNote" class="help" hidden></p>
 
           <div id="transferActions" class="actions" hidden>
@@ -307,7 +355,313 @@
         </section>
       </main>
 
-      <aside aria-label="Privacy">
+      <!-- DEVELOPERS: a live view of this browser's own connection. Filled in by devtab.js from the
+           in-page recorder (inspector.js). Nothing here is sent anywhere. -->
+      <main id="viewDevelopers" class="dev" aria-label="Developers" hidden>
+        <div class="card dev-head">
+          <div>
+            <h2 class="section-title">Under the hood</h2>
+            <p class="help help-tight">
+              What this browser is doing right now: the introduction through the server, the direct
+              connection, and the encryption. Open this tab on the sending and the receiving side to
+              see both halves. Nothing on this page is sent anywhere.
+            </p>
+          </div>
+          <div class="dev-controls">
+            <label class="check">
+              <input id="devMaskIps" type="checkbox" />
+              <span>Mask IP addresses</span>
+            </label>
+            <label class="check">
+              <input id="devShowKey" type="checkbox" />
+              <span>Show key (demo only)</span>
+            </label>
+            <button id="btnDevPause" class="btn btn-secondary btn-sm" type="button">
+              Pause log
+            </button>
+            <button id="btnDevClear" class="btn btn-secondary btn-sm" type="button">
+              Clear log
+            </button>
+            <button id="btnDevCopy" class="btn btn-secondary btn-sm" type="button">
+              Copy as JSON
+            </button>
+          </div>
+        </div>
+
+        <dl class="stats dev-summary card" aria-label="Session summary">
+          <div class="stat">
+            <dt>Role</dt>
+            <dd id="devRole">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Room</dt>
+            <dd id="devRoom">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Connection</dt>
+            <dd id="devIce">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Path</dt>
+            <dd id="devPathKind">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Round trip</dt>
+            <dd id="devRtt">–</dd>
+          </div>
+          <div class="stat">
+            <dt>Through the link</dt>
+            <dd id="devRate">–</dd>
+          </div>
+        </dl>
+
+        <div class="dev-grid">
+          <section class="card dev-card" aria-labelledby="devStepsTitle">
+            <h3 id="devStepsTitle" class="dev-title">Steps</h3>
+            <ol id="devSteps" class="dev-steps">
+              <li data-step="key">
+                <span class="step-name">Room key ready</span><span class="step-state">waiting</span>
+              </li>
+              <li data-step="signaling">
+                <span class="step-name">Reach the signaling server</span
+                ><span class="step-state">waiting</span>
+              </li>
+              <li data-step="room">
+                <span class="step-name">Room created or joined</span
+                ><span class="step-state">waiting</span>
+              </li>
+              <li data-step="peer">
+                <span class="step-name">Other side present</span
+                ><span class="step-state">waiting</span>
+              </li>
+              <li data-step="offer">
+                <span class="step-name">Offer (SDP) exchanged</span
+                ><span class="step-state">waiting</span>
+              </li>
+              <li data-step="answer">
+                <span class="step-name">Answer (SDP) exchanged</span
+                ><span class="step-state">waiting</span>
+              </li>
+              <li data-step="candidates">
+                <span class="step-name">Network addresses (ICE) gathered</span
+                ><span class="step-state">waiting</span>
+              </li>
+              <li data-step="pair">
+                <span class="step-name">Network path selected</span
+                ><span class="step-state">waiting</span>
+              </li>
+              <li data-step="dtls">
+                <span class="step-name">DTLS handshake done</span
+                ><span class="step-state">waiting</span>
+              </li>
+              <li data-step="channel">
+                <span class="step-name">Data channel open, server dropped</span
+                ><span class="step-state">waiting</span>
+              </li>
+              <li data-step="header">
+                <span class="step-name">File header encrypted and checked</span
+                ><span class="step-state">waiting</span>
+              </li>
+              <li data-step="chunks">
+                <span class="step-name">Chunks encrypted, sent, decrypted</span
+                ><span class="step-state">waiting</span>
+              </li>
+              <li data-step="ack">
+                <span class="step-name">Receiver confirms each file</span
+                ><span class="step-state">waiting</span>
+              </li>
+            </ol>
+          </section>
+
+          <section class="card dev-card" aria-labelledby="devSdpTitle">
+            <h3 id="devSdpTitle" class="dev-title">SDP: the session description</h3>
+            <p class="help help-tight">
+              Each side describes how it can be reached. The server only relays these text blobs.
+            </p>
+            <div class="dev-seg" role="group" aria-label="Which description">
+              <button id="devSdpLocal" class="dev-seg-btn" type="button" aria-pressed="true">
+                Ours
+              </button>
+              <button id="devSdpRemote" class="dev-seg-btn" type="button" aria-pressed="false">
+                Theirs
+              </button>
+            </div>
+            <dl id="devSdpSummary" class="dev-kv"></dl>
+            <details class="dev-raw">
+              <summary>Raw SDP</summary>
+              <pre id="devSdpRaw" class="dev-pre" tabindex="0"></pre>
+            </details>
+          </section>
+
+          <section class="card dev-card wide" aria-labelledby="devCandTitle">
+            <h3 id="devCandTitle" class="dev-title">ICE candidates</h3>
+            <p class="help help-tight">
+              <strong>host</strong> is an address on this machine, <strong>srflx</strong> is the
+              public address a STUN server saw, <strong>relay</strong> is a TURN server forwarding
+              for us.
+            </p>
+            <div class="dev-scroll" tabindex="0" role="region" aria-label="ICE candidates table">
+              <table class="dev-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Whose</th>
+                    <th scope="col">Type</th>
+                    <th scope="col">Protocol</th>
+                    <th scope="col">Address</th>
+                    <th scope="col">Port</th>
+                    <th scope="col">Priority</th>
+                  </tr>
+                </thead>
+                <tbody id="devCandBody"></tbody>
+              </table>
+            </div>
+            <p id="devIceServers" class="help"></p>
+          </section>
+
+          <section
+            id="devPeersCard"
+            class="card dev-card wide"
+            aria-labelledby="devPeersTitle"
+            hidden
+          >
+            <h3 id="devPeersTitle" class="dev-title">
+              Connections (one direct connection per receiver)
+            </h3>
+            <p class="help help-tight">
+              The panels below follow the first receiver. Every receiver gets the same encrypted
+              chunks, and the slowest one sets the pace.
+            </p>
+            <div class="dev-scroll" tabindex="0" role="region" aria-label="Receivers table">
+              <table class="dev-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Receiver</th>
+                    <th scope="col">State</th>
+                    <th scope="col">Path</th>
+                    <th scope="col">Round trip</th>
+                    <th scope="col">Files confirmed</th>
+                    <th scope="col">Data delivered</th>
+                  </tr>
+                </thead>
+                <tbody id="devPeersBody"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="card dev-card" aria-labelledby="devPathTitle">
+            <h3 id="devPathTitle" class="dev-title">Selected network path</h3>
+            <dl id="devPathKv" class="dev-kv"></dl>
+          </section>
+
+          <section class="card dev-card" aria-labelledby="devSecTitle">
+            <h3 id="devSecTitle" class="dev-title">Transport security (DTLS)</h3>
+            <dl id="devSecKv" class="dev-kv"></dl>
+            <p class="help">
+              This is the first layer: WebRTC encrypts every data channel itself. The file is also
+              encrypted by this app, below.
+            </p>
+          </section>
+
+          <section class="card dev-card wide" aria-labelledby="devCryptoTitle">
+            <h3 id="devCryptoTitle" class="dev-title">Encryption done by this app (AES-256-GCM)</h3>
+            <dl id="devKeyKv" class="dev-kv"></dl>
+            <p class="help">
+              Nonce (12 bytes) = file number in the high 4 bytes, chunk number in the low 8 bytes.
+              The file header uses a reserved chunk number, so no key and nonce pair is ever used
+              twice. Rows below are sampled: the first three, every 64th, and the last.
+            </p>
+            <div class="dev-scroll" tabindex="0" role="region" aria-label="Encryption steps table">
+              <table class="dev-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Step</th>
+                    <th scope="col">File</th>
+                    <th scope="col">Chunk</th>
+                    <th scope="col">Nonce</th>
+                    <th scope="col">Plain</th>
+                    <th scope="col">Cipher</th>
+                    <th scope="col">First bytes of ciphertext</th>
+                    <th scope="col">Time</th>
+                  </tr>
+                </thead>
+                <tbody id="devChunkBody"></tbody>
+              </table>
+            </div>
+            <p id="devTotals" class="help"></p>
+          </section>
+
+          <section class="card dev-card" aria-labelledby="devFlowTitle">
+            <h3 id="devFlowTitle" class="dev-title">Flow control and speed</h3>
+            <svg
+              id="devSpark"
+              class="dev-spark"
+              viewBox="0 0 300 64"
+              preserveAspectRatio="none"
+              role="img"
+              aria-label="Bytes per second through the link, last 60 seconds"
+            >
+              <path id="devSparkRecv" class="spark-recv" d="" />
+              <path id="devSparkSent" class="spark-sent" d="" />
+            </svg>
+            <p class="help">
+              <span class="key-dot key-sent" aria-hidden="true"></span>Sent
+              <span class="key-dot key-recv" aria-hidden="true"></span>Received
+            </p>
+            <dl id="devFlowKv" class="dev-kv"></dl>
+            <p class="help">
+              Sending pauses when 1 MB is waiting in the channel and resumes below 256 KB, so memory
+              stays flat on slow links.
+            </p>
+          </section>
+
+          <section class="card dev-card" aria-labelledby="devServerTitle">
+            <h3 id="devServerTitle" class="dev-title">What the server can see</h3>
+            <p id="devKeyCheck" class="dev-check" role="status"></p>
+            <h4 class="dev-sub">Sent to the server this session</h4>
+            <ul id="devServerSent" class="dev-list"></ul>
+            <h4 class="dev-sub">Never sent to the server</h4>
+            <ul class="dev-list">
+              <li>The encryption key (it only lives in the link after the #)</li>
+              <li>File names, sizes and contents</li>
+              <li>Anything said over the direct channel</li>
+            </ul>
+          </section>
+
+          <section class="card dev-card wide" aria-labelledby="devLogTitle">
+            <div class="section-head">
+              <h3 id="devLogTitle" class="dev-title">Event log</h3>
+              <span id="devLogCount" class="help"></span>
+            </div>
+            <fieldset class="dev-filters">
+              <legend class="visually-hidden">Show these kinds of events</legend>
+              <label class="check"
+                ><input type="checkbox" data-cat="signaling" checked /><span>Signaling</span></label
+              >
+              <label class="check"
+                ><input type="checkbox" data-cat="sdp" checked /><span>SDP</span></label
+              >
+              <label class="check"
+                ><input type="checkbox" data-cat="ice" checked /><span>ICE</span></label
+              >
+              <label class="check"
+                ><input type="checkbox" data-cat="channel" checked /><span>Channel</span></label
+              >
+              <label class="check"
+                ><input type="checkbox" data-cat="crypto" checked /><span>Crypto</span></label
+              >
+              <label class="check"
+                ><input type="checkbox" data-cat="transfer" checked /><span>Transfer</span></label
+              >
+              <label class="check"
+                ><input type="checkbox" data-cat="flow" checked /><span>Flow</span></label
+              >
+            </fieldset>
+            <ol id="devLog" class="dev-log" tabindex="0" aria-label="Event log, newest first"></ol>
+          </section>
+        </div>
+      </main>
+
+      <aside id="privacyAside" aria-label="Privacy">
         <details class="privacy">
           <summary>How your files stay private</summary>
           <ul>
@@ -345,11 +699,14 @@
     ></div>
 
     <script src="/vendor/qrcode.js"></script>
+    <script src="/inspector.js"></script>
     <script src="/fileChunker.js"></script>
     <script src="/chunkCrypto.js"></script>
     <script src="/webrtcSender.js"></script>
     <script src="/webrtcReceiver.js"></script>
     <script src="/webrtcManager.js"></script>
+    <script src="/senderHub.js"></script>
     <script src="/app.js"></script>
+    <script src="/devtab.js"></script>
   </body>
 </html>

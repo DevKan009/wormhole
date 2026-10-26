@@ -22,6 +22,26 @@ const RAW_CHUNK_SIZE = 65536;
 const MAX_FILE_NAME_LENGTH = 200;
 const MAX_FILES_PER_SESSION = 1000;
 
+// The Developers tab's recorder. Absent in Node tests, where every call below is a no-op.
+const INSPECTOR = typeof Inspector !== 'undefined' ? Inspector : null;
+
+/** A signaling message reduced to what the Developers tab should list (SDP shown by size). */
+function describeSignal(msg) {
+  if (!msg || typeof msg !== 'object') return {};
+  const out = { ...msg };
+  if (typeof out.sdp === 'string') out.sdp = `(${out.sdp.length} bytes, see SDP panel)`;
+  return out;
+}
+
+/** ICE servers for display: addresses only, never the TURN username or password. */
+function describeIceServers(config) {
+  const servers = (config && config.iceServers) || [];
+  return servers.map((s) => ({
+    urls: Array.isArray(s.urls) ? s.urls : [s.urls],
+    credentials: Boolean(s.username || s.credential)
+  }));
+}
+
 /**
  * Turns an untrusted remote file name into a safe download name.
  * @param {unknown} name
@@ -113,6 +133,9 @@ class WebRTCManager {
 
     this._keepAliveTimer = null;
     this._graceTimer = null;
+    this._statsTimer = null;
+    this.statsIntervalMs = options.statsIntervalMs ?? 1000;
+    this._traceTotals = { chunks: 0, plainBytes: 0, cipherBytes: 0 };
     this._epoch = 0; // bumped on reset so a stale connection attempt stops quietly
     this.ws = null;
     this.pc = null;
@@ -151,6 +174,85 @@ class WebRTCManager {
     this.onError = options.onError || (() => {});
   }
 
+  /** Records an event for the Developers tab. No-op where the recorder is not loaded. */
+  _trace(cat, type, data, peer = null) {
+    if (INSPECTOR) INSPECTOR.emit(cat, type, data, peer);
+  }
+
+  /** Sends a signaling message and records it. Returns false when the socket is not open. */
+  _sendSignal(obj) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    const text = JSON.stringify(obj);
+    this.ws.send(text);
+    this._trace('signaling', 'out', {
+      type: obj.type,
+      bytes: text.length,
+      payload: describeSignal(obj),
+      // Checked on the real outgoing text, before any scrubbing, for the "what the server sees" box
+      containsKey: Boolean(this.keyBase64Url) && text.includes(this.keyBase64Url)
+    });
+    return true;
+  }
+
+  /** Fingerprint of the room key (never the key) for the Developers tab. */
+  async _traceKey(origin) {
+    if (!INSPECTOR || !this.cryptoKey) return;
+    try {
+      // From the link's key text: the receiver's imported key is deliberately not extractable
+      const b64 = this.keyBase64Url.replace(/-/g, '+').replace(/_/g, '/');
+      const bin = atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4));
+      const raw = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+      const digest = await crypto.subtle.digest('SHA-256', raw);
+      const fingerprint = INSPECTOR.hex(digest, 8);
+      INSPECTOR.setSecret(this.keyBase64Url);
+      INSPECTOR.set('key', { algorithm: 'AES-GCM', bits: 256, fingerprint, origin });
+      this._trace('crypto', 'key', { algorithm: 'AES-GCM-256', fingerprint, origin });
+    } catch {
+      // Tracing must never get in the way of a transfer
+    }
+  }
+
+  /**
+   * One encrypted (sender) or decrypted (receiver) chunk. Every chunk is counted, but only the
+   * first few, every 64th and the last get a row: a fast transfer is thousands of chunks a second.
+   */
+  _traceChunk(kind, info) {
+    if (!INSPECTOR) return;
+    const cipherBytes = info.cipher.byteLength;
+    const totals = this._traceTotals;
+    totals.chunks++;
+    totals.plainBytes += cipherBytes - 16;
+    totals.cipherBytes += cipherBytes;
+    const sampled = INSPECTOR.shouldSampleChunk(info.chunkIndex, info.totalChunks);
+    if (sampled) {
+      this._trace('crypto', `chunk-${kind}`, {
+        fileIndex: info.fileIndex,
+        chunkIndex: info.chunkIndex,
+        totalChunks: info.totalChunks,
+        nonce: INSPECTOR.nonceHex(info.fileIndex, info.chunkIndex),
+        plainBytes: cipherBytes - 16,
+        cipherBytes,
+        preview: INSPECTOR.hex(info.cipher, 12),
+        ms: info.ms == null ? null : Math.round(info.ms * 100) / 100
+      });
+    }
+    if (sampled || totals.chunks % 16 === 0) INSPECTOR.set('totals', { ...totals, kind });
+  }
+
+  _traceSession() {
+    if (!INSPECTOR) return;
+    INSPECTOR.set('session', {
+      role: this.isInitiator ? 'sender' : 'receiver',
+      roomCode: this.roomCode
+    });
+  }
+
+  _traceSdp(side, type, sdp) {
+    if (!INSPECTOR) return;
+    INSPECTOR.set(`sdp.${side}`, { type, sdp, parsed: INSPECTOR.parseSdp(sdp) });
+    this._trace('sdp', `${side}-${type}`, { bytes: sdp.length });
+  }
+
   _getDefaultWsUrl() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${protocol}//${window.location.host}`;
@@ -185,6 +287,7 @@ class WebRTCManager {
       console.warn('Using default STUN configuration:', err);
       this.rtcConfig = DEFAULT_RTC_CONFIG;
     }
+    this._trace('ice', 'config', { servers: describeIceServers(this.rtcConfig) });
   }
 
   /**
@@ -241,6 +344,7 @@ class WebRTCManager {
 
       ws.onopen = () => {
         opened = true;
+        this._trace('signaling', 'open', { url: this.wsUrl });
         this.onStateChange('SIGNALING_CONNECTED');
         this._startKeepAlive(ws);
         resolve();
@@ -262,18 +366,9 @@ class WebRTCManager {
         this._stopKeepAlive();
         if (this.ws !== ws) return;
         this.ws = null;
+        this._trace('signaling', 'close', {});
         this.onStateChange('SIGNALING_DISCONNECTED');
-        // Signaling is only needed to set up the connection. Once the peers are connected (or the
-        // transfer is over) a closed signaling socket is expected: each side leaves the room as soon
-        // as its data channel opens, and the server then drops the other socket. The other side's
-        // channel may not have fired onopen yet, so an ICE state of checking/connected also counts.
-        const ice = this.pc ? this.pc.iceConnectionState : 'none';
-        const negotiated = ice === 'checking' || ice === 'connected' || ice === 'completed';
-        if (!this.peerConnected && !this._finished && !negotiated) {
-          this._teardownP2P();
-          this._reportError('Signaling connection closed before the peer connected');
-          this.onP2PDisconnected();
-        }
+        this._handleSignalingClosed();
       };
 
       ws.onmessage = (event) => {
@@ -283,6 +378,13 @@ class WebRTCManager {
         } catch (err) {
           console.error('Failed to parse signaling message:', err);
           return;
+        }
+        if (msg && msg.type !== 'pong') {
+          this._trace('signaling', 'in', {
+            type: msg.type,
+            bytes: String(event.data).length,
+            payload: describeSignal(msg)
+          });
         }
         // Handle strictly in arrival order: handlers await WebRTC calls, and an ICE candidate must
         // never be processed before the offer/answer that precedes it.
@@ -296,11 +398,33 @@ class WebRTCManager {
     });
   }
 
+  /**
+   * The signaling socket closed after it had opened. Signaling is only needed to set up the
+   * connection. Once the peers are connected (or the transfer is over) a closed socket is expected:
+   * each side leaves the room as soon as its data channel opens, and the server then drops the
+   * other socket. The other side's channel may not have fired onopen yet, so an ICE state of
+   * checking/connected also counts.
+   */
+  _handleSignalingClosed() {
+    const ice = this.pc ? this.pc.iceConnectionState : 'none';
+    const negotiated = ice === 'checking' || ice === 'connected' || ice === 'completed';
+    if (!this.peerConnected && !this._finished && !negotiated) {
+      this._teardownP2P();
+      this._reportError('Signaling connection closed before the peer connected');
+      this.onP2PDisconnected();
+    }
+  }
+
+  /** Whether to ping the server now. Free hosts sleep when idle, and waiting people are idle. */
+  _wantsKeepAlive() {
+    return !this.peerConnected;
+  }
+
   _startKeepAlive(ws) {
     this._stopKeepAlive();
     if (!(this.keepAliveMs > 0)) return;
     this._keepAliveTimer = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN && !this.peerConnected) {
+      if (ws.readyState === WebSocket.OPEN && this._wantsKeepAlive()) {
         ws.send('{"type":"ping"}');
       }
     }, this.keepAliveMs);
@@ -317,11 +441,13 @@ class WebRTCManager {
    */
   async createRoom() {
     this._resetSession();
+    if (INSPECTOR) INSPECTOR.set('session', { role: 'sender', roomCode: null });
     this.cryptoKey = await generateAESKey();
     this.keyBase64Url = await keyToBase64Url(this.cryptoKey);
+    await this._traceKey('generated in this browser');
     await this.connectSignaling();
     this.isInitiator = true;
-    this.ws.send(JSON.stringify({ type: 'create' }));
+    this._sendSignal({ type: 'create' });
   }
 
   /**
@@ -340,10 +466,12 @@ class WebRTCManager {
       return;
     }
     this.keyBase64Url = keyBase64Url;
+    if (INSPECTOR) INSPECTOR.set('session', { role: 'receiver', roomCode: null });
+    await this._traceKey('read from the link fragment');
     await this.connectSignaling();
     this.isInitiator = false;
     const cleanCode = (code || '').trim().toUpperCase();
-    this.ws.send(JSON.stringify({ type: 'join', roomCode: cleanCode }));
+    this._sendSignal({ type: 'join', roomCode: cleanCode });
   }
 
   /**
@@ -353,6 +481,7 @@ class WebRTCManager {
     switch (msg.type) {
       case 'created':
         this.roomCode = msg.roomCode;
+        this._traceSession();
         this.onRoomCreated(msg.roomCode);
         // Messages are handled in order, so the config is ready before any peer-joined arrives
         await this._loadRtcConfig(msg.roomCode);
@@ -360,6 +489,7 @@ class WebRTCManager {
 
       case 'joined':
         this.roomCode = msg.roomCode;
+        this._traceSession();
         this.onJoined(msg.roomCode);
         await this._loadRtcConfig(msg.roomCode);
         this._initPeerConnection();
@@ -385,6 +515,12 @@ class WebRTCManager {
         break;
 
       case 'ice-candidate':
+        if (INSPECTOR && msg.candidate && typeof msg.candidate.candidate === 'string') {
+          this._trace('ice', 'candidate-remote', {
+            raw: msg.candidate.candidate,
+            parsed: INSPECTOR.parseCandidate(msg.candidate.candidate)
+          });
+        }
         await this._handleRemoteCandidate(msg.candidate);
         break;
 
@@ -407,20 +543,36 @@ class WebRTCManager {
     this.pc = pc;
 
     pc.addEventListener('icecandidate', (event) => {
-      if (event.candidate && this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(
-          JSON.stringify({
-            type: 'ice-candidate',
-            candidate: event.candidate
-          })
-        );
+      if (event.candidate) {
+        if (INSPECTOR) {
+          this._trace('ice', 'candidate-local', {
+            raw: event.candidate.candidate,
+            parsed: INSPECTOR.parseCandidate(event.candidate.candidate)
+          });
+        }
+        this._sendSignal({ type: 'ice-candidate', candidate: event.candidate });
+      } else {
+        this._trace('ice', 'gathering-done', {});
       }
     });
+
+    // Connection milestones for the Developers tab
+    pc.addEventListener('icegatheringstatechange', () => {
+      this._trace('ice', 'gathering', { state: pc.iceGatheringState });
+    });
+    pc.addEventListener('connectionstatechange', () => {
+      this._trace('ice', 'connection', { state: pc.connectionState });
+    });
+    pc.addEventListener('signalingstatechange', () => {
+      this._trace('ice', 'signaling-state', { state: pc.signalingState });
+    });
+    this._startStatsPolling(pc);
 
     // Listener (not the on-property): WebRTCFileSender watches the same event on the same pc.
     pc.addEventListener('iceconnectionstatechange', () => {
       if (this.pc !== pc) return;
       const state = pc.iceConnectionState;
+      this._trace('ice', 'state', { state });
       this.onStateChange(`ICE_${state.toUpperCase()}`);
       if (state === 'disconnected') {
         this._beginReconnectGrace();
@@ -450,31 +602,32 @@ class WebRTCManager {
   async _createAndSendOffer() {
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
-    this.ws.send(
-      JSON.stringify({
-        type: 'offer',
-        sdp: offer.sdp
-      })
-    );
+    this._traceSdp('local', 'offer', offer.sdp);
+    this._requireSent({ type: 'offer', sdp: offer.sdp });
   }
 
   async _handleOffer(msg) {
     if (!this.pc) this._initPeerConnection();
     await this.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+    this._traceSdp('remote', 'offer', msg.sdp);
     await this._flushPendingCandidates();
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
-    this.ws.send(
-      JSON.stringify({
-        type: 'answer',
-        sdp: answer.sdp
-      })
-    );
+    this._traceSdp('local', 'answer', answer.sdp);
+    this._requireSent({ type: 'answer', sdp: answer.sdp });
   }
 
   async _handleAnswer(msg) {
     await this.pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+    this._traceSdp('remote', 'answer', msg.sdp);
     await this._flushPendingCandidates();
+  }
+
+  /** An offer or answer that cannot be sent means the connection cannot be set up. */
+  _requireSent(obj) {
+    if (!this._sendSignal(obj)) {
+      throw new Error('Signaling connection closed before the peer connected');
+    }
   }
 
   /**
@@ -510,6 +663,14 @@ class WebRTCManager {
 
     dc.onopen = () => {
       this.peerConnected = true;
+      this._trace('channel', 'open', {
+        label: dc.label,
+        id: dc.id,
+        ordered: dc.ordered,
+        binaryType: dc.binaryType,
+        bufferedAmountLowThreshold: dc.bufferedAmountLowThreshold,
+        maxMessageSize: this.pc && this.pc.sctp ? this.pc.sctp.maxMessageSize : null
+      });
       this.onStateChange('P2P_CONNECTED');
       // The room has done its job. Leaving now destroys it on the server immediately, so the
       // link cannot be used by anyone else.
@@ -519,6 +680,7 @@ class WebRTCManager {
 
     dc.onclose = () => {
       this.peerConnected = false;
+      this._trace('channel', 'close', {});
       this.onStateChange('P2P_DISCONNECTED');
       this._handleConnectionLost('Data channel closed');
     };
@@ -587,6 +749,18 @@ class WebRTCManager {
       fileCount: this._batch ? this._batch.fileCount : null,
       totalBytes: this._batch ? this._batch.totalBytes : null
     });
+    this._trace('crypto', 'header-decrypt', {
+      fileIndex,
+      nonce: INSPECTOR ? INSPECTOR.nonceHex(fileIndex, (1n << 64n) - 1n) : null,
+      authenticated: true,
+      plaintext: {
+        fileName: header.fileName,
+        fileSize: header.fileSize,
+        totalChunks: header.totalChunks,
+        fileCount: header.fileCount
+      },
+      ciphertextChars: typeof control.header === 'string' ? control.header.length : null
+    });
     if (!this._batch) {
       this._batch = { fileCount: header.fileCount, totalBytes: header.totalBytes, nextIndex: 0 };
     }
@@ -615,15 +789,29 @@ class WebRTCManager {
       onProgress: (p) => {
         this.onFileProgress({ ...p, ...batchInfo, isReceiver: true });
       },
+      onChunk: (info) => this._traceChunk('decrypt', info),
       onComplete: (res) => {
         this.fileReceiver = null;
         if (isLast) this._finished = true;
         this._sendControl({ type: 'FILE_ACK', ok: true, fileIndex });
+        this._trace('transfer', 'ack-sent', { fileIndex, fileName: header.fileName });
+        this._trace('transfer', 'file-done', {
+          fileIndex,
+          fileName: header.fileName,
+          bytes: res.totalBytes,
+          storage: res.storage
+        });
         this.onFileComplete({ ...res, ...batchInfo, isLast, isReceiver: true });
       },
       onError: (err) => this._failTransfer(err)
     });
 
+    this._trace('transfer', 'file-start', {
+      fileIndex,
+      fileName: header.fileName,
+      fileSize: header.fileSize,
+      totalChunks: header.totalChunks
+    });
     this.onFileTransferStart({
       ...batchInfo,
       totalChunks: header.totalChunks,
@@ -642,6 +830,7 @@ class WebRTCManager {
     }
     // Confirmations arrive in order, for files that have already been started
     const queue = this._sendQueue;
+    this._trace('transfer', 'ack-received', { fileIndex: control.fileIndex, ok: control.ok });
     if (!queue || control.fileIndex !== queue.acked || control.fileIndex > queue.index) {
       this._failTransfer(new Error('Unexpected acknowledgement from the receiver'));
       return;
@@ -718,6 +907,7 @@ class WebRTCManager {
       worker: this.worker,
       peerConnection: this.pc,
       tolerateDisconnect: true, // the manager owns the reconnect grace period
+      onChunk: (info) => this._traceChunk('encrypt', info),
       onProgress: (p) => {
         const queue = this._sendQueue;
         const file = queue.files[queue.index];
@@ -748,6 +938,7 @@ class WebRTCManager {
       },
       onError: (err) => this._failTransfer(err),
       onBackpressureChange: (isPaused, bufferedAmount) => {
+        this._trace('flow', isPaused ? 'pause' : 'resume', { bufferedAmount });
         this.onBackpressureChange(isPaused, bufferedAmount);
       }
     });
@@ -781,7 +972,25 @@ class WebRTCManager {
     );
     if (this._failed || !this.dataChannel) return;
     this.dataChannel.send(JSON.stringify({ type: 'FILE_HEADER', header }));
+    this._trace('crypto', 'header-encrypt', {
+      fileIndex,
+      nonce: INSPECTOR ? INSPECTOR.nonceHex(fileIndex, (1n << 64n) - 1n) : null,
+      plaintext: {
+        fileName: file.name,
+        fileSize: file.size,
+        totalChunks,
+        fileCount: queue.files.length
+      },
+      ciphertextChars: header.length,
+      ciphertextPreview: header.slice(0, 40)
+    });
 
+    this._trace('transfer', 'file-start', {
+      fileIndex,
+      fileName: file.name,
+      fileSize: file.size,
+      totalChunks
+    });
     this.onFileTransferStart({
       fileName: file.name,
       fileSize: file.size,
@@ -890,9 +1099,61 @@ class WebRTCManager {
     }
   }
 
+  /**
+   * Once a second, reads the selected network path, DTLS details and byte counts for the
+   * Developers tab. Runs for the life of the peer connection.
+   */
+  _startStatsPolling(pc) {
+    if (!INSPECTOR || this._statsTimer || !(this.statsIntervalMs > 0)) return;
+    if (typeof pc.getStats !== 'function') return;
+    let prev = null;
+    let pairTraced = false;
+    let dtlsTraced = false;
+    let series = [];
+    const tick = async () => {
+      if (this.pc !== pc) return;
+      let view;
+      try {
+        view = INSPECTOR.summarizeStats(await pc.getStats());
+      } catch {
+        return;
+      }
+      const now = Date.now();
+      const sent = view.pair ? view.pair.bytesSent : 0;
+      const received = view.pair ? view.pair.bytesReceived : 0;
+      let sentPerSec = 0;
+      let recvPerSec = 0;
+      if (prev && now > prev.t) {
+        const seconds = (now - prev.t) / 1000;
+        sentPerSec = Math.max(0, (sent - prev.sent) / seconds);
+        recvPerSec = Math.max(0, (received - prev.received) / seconds);
+      }
+      prev = { t: now, sent, received };
+      series = [...series.slice(-59), { t: now, sent: sentPerSec, recv: recvPerSec }];
+      INSPECTOR.set('stats', { ...view, sentPerSec, recvPerSec });
+      INSPECTOR.set('series', series);
+      if (view.pair && !pairTraced) {
+        pairTraced = true;
+        this._trace('ice', 'pair-selected', view.pair);
+      }
+      if (view.transport && view.transport.dtlsState === 'connected' && !dtlsTraced) {
+        dtlsTraced = true;
+        this._trace('ice', 'dtls', view.transport);
+      }
+    };
+    this._statsTimer = setInterval(tick, this.statsIntervalMs);
+    tick();
+  }
+
+  _stopStatsPolling() {
+    clearInterval(this._statsTimer);
+    this._statsTimer = null;
+  }
+
   _teardownP2P() {
     clearTimeout(this._graceTimer);
     this._graceTimer = null;
+    this._stopStatsPolling();
     if (this.worker) {
       this.worker.terminate();
       this.worker = null;
@@ -918,6 +1179,8 @@ class WebRTCManager {
   }
 
   _resetSession() {
+    if (INSPECTOR) INSPECTOR.reset();
+    this._traceTotals = { chunks: 0, plainBytes: 0, cipherBytes: 0 };
     this._epoch++;
     this._teardownP2P();
     this._closeSignaling();
@@ -950,9 +1213,23 @@ class WebRTCManager {
   }
 }
 
+// Shared with SenderHub (senderHub.js), which sends to several receivers
+const SHARED_HELPERS = {
+  DEFAULT_RTC_CONFIG,
+  RAW_CHUNK_SIZE,
+  MAX_FILES_PER_SESSION,
+  describeSignal,
+  describeIceServers
+};
+
 // Pure helpers are exported for Node tests; the class itself needs browser APIs.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { sanitizeFileName, validateFileHeader, WebRTCManager };
+  module.exports = {
+    sanitizeFileName,
+    validateFileHeader,
+    WebRTCManager,
+    helpers: SHARED_HELPERS
+  };
 }
 
 // Global attachment
@@ -960,4 +1237,5 @@ if (typeof window !== 'undefined') {
   window.WebRTCManager = WebRTCManager;
   window.sanitizeFileName = sanitizeFileName;
   window.validateFileHeader = validateFileHeader;
+  window.WebRTCHelpers = SHARED_HELPERS;
 }

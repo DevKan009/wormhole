@@ -163,6 +163,8 @@ function resolveLimits(env = process.env, overrides = {}) {
     maxMessagesPerWindow: num(env.MAX_MESSAGES_PER_10S, 100),
     maxFailedJoins: num(env.MAX_FAILED_JOINS, 5),
     maxIceMissesPerMinute: num(env.MAX_ICE_MISSES_PER_MIN, 60),
+    maxPeersPerRoom: num(env.MAX_PEERS_PER_ROOM, 8),
+    maxRoomRelays: num(env.MAX_ROOM_RELAYS, 2000),
     roomMaxAgeMs: num(env.ROOM_MAX_AGE_MIN, 60) * 60 * 1000,
     trustProxyHops: parseInt(env.TRUST_PROXY_HOPS, 10) > 0 ? parseInt(env.TRUST_PROXY_HOPS, 10) : 0,
     ...overrides
@@ -438,6 +440,16 @@ function createSignalingServer(options = {}) {
     const room = rooms.get(roomCode);
     if (!room) return;
 
+    // In a room for several receivers one of them leaving (they do so as soon as their direct
+    // connection is up) must not end the others' setup. Only the sender leaving ends the room.
+    if (room.maxPeers > 1 && ws !== room.host) {
+      room.delete(ws);
+      if (room.host && room.host.readyState === WebSocket.OPEN) {
+        sendJSON(room.host, { type: 'peer-left', roomCode, peerId: ws.peerId });
+      }
+      return;
+    }
+
     // Immediately remove room from registry (zero retention)
     rooms.delete(roomCode);
 
@@ -557,13 +569,32 @@ function createSignalingServer(options = {}) {
           }
         }
 
+        // How many people the sender wants to send to (default 1). One link, one key, that many slots.
+        let maxPeers = 1;
+        if (parsed.maxPeers !== undefined) {
+          maxPeers = Number(parsed.maxPeers);
+          if (!Number.isInteger(maxPeers) || maxPeers < 1 || maxPeers > limits.maxPeersPerRoom) {
+            sendJSON(ws, {
+              type: 'error',
+              message: `maxPeers must be a whole number from 1 to ${limits.maxPeersPerRoom}`
+            });
+            return;
+          }
+        }
+
         const roomCode = generateRoomCode(rooms);
         const room = new Set([ws]);
         room.createdAt = now;
+        room.maxPeers = maxPeers;
+        room.host = ws;
+        room.guestsEver = 0; // joins ever made: a slot is not freed when someone leaves
+        room.locked = false;
+        room.relays = 0;
         rooms.set(roomCode, room);
         ws.roomCode = roomCode;
+        ws.peerId = 'host';
 
-        sendJSON(ws, { type: 'created', roomCode });
+        sendJSON(ws, { type: 'created', roomCode, maxPeers });
         return;
       }
 
@@ -594,23 +625,52 @@ function createSignalingServer(options = {}) {
           return;
         }
 
-        if (room.size >= 2) {
+        if (room.guestsEver >= room.maxPeers || room.size >= room.maxPeers + 1) {
           sendJSON(ws, { type: 'error', message: 'Room is full' });
+          return;
+        }
+        if (room.locked) {
+          sendJSON(ws, { type: 'error', message: 'This transfer has already started' });
           return;
         }
 
         room.add(ws);
+        room.guestsEver++;
         ws.roomCode = requestedCode;
+        ws.peerId = crypto.randomBytes(4).toString('hex');
 
         // Confirm join to the joiner
-        sendJSON(ws, { type: 'joined', roomCode: requestedCode });
+        sendJSON(ws, {
+          type: 'joined',
+          roomCode: requestedCode,
+          peerId: ws.peerId,
+          maxPeers: room.maxPeers
+        });
 
         // Notify the creator that the peer has joined so WebRTC offer negotiation can begin
         for (const peer of room) {
           if (peer !== ws && peer.readyState === WebSocket.OPEN) {
-            sendJSON(peer, { type: 'peer-joined', roomCode: requestedCode });
+            sendJSON(peer, {
+              type: 'peer-joined',
+              roomCode: requestedCode,
+              peerId: ws.peerId,
+              joined: room.guestsEver,
+              maxPeers: room.maxPeers
+            });
           }
         }
+        return;
+      }
+
+      // 2b. The sender closes the room to newcomers (everyone expected has arrived, or it starts
+      // with fewer people than planned).
+      if (type === 'lock') {
+        const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
+        if (!room || room.host !== ws) {
+          sendJSON(ws, { type: 'error', message: 'Only the sender can lock the room' });
+          return;
+        }
+        room.locked = true;
         return;
       }
 
@@ -625,10 +685,30 @@ function createSignalingServer(options = {}) {
         const room = rooms.get(roomCode);
         let delivered = false;
 
-        // Relay the unmodified raw payload directly to the other peer only
-        for (const peer of room) {
-          if (peer !== ws && peer.readyState === WebSocket.OPEN) {
-            peer.send(rawBuffer, { binary: isBinary });
+        if (room.maxPeers === 1) {
+          // One receiver: relay the unmodified raw payload directly to the other peer only
+          for (const peer of room) {
+            if (peer !== ws && peer.readyState === WebSocket.OPEN) {
+              peer.send(rawBuffer, { binary: isBinary });
+              delivered = true;
+            }
+          }
+        } else {
+          // Several receivers: the sender talks to each receiver by id, and receivers can only
+          // talk to the sender. The server stamps who a message is from, so it cannot be forged.
+          if (++room.relays > limits.maxRoomRelays) {
+            sendJSON(ws, { type: 'error', message: 'Too many messages in this room' });
+            return;
+          }
+          let target = room.host;
+          if (ws === room.host) {
+            target = null;
+            for (const peer of room) {
+              if (peer !== ws && peer.peerId === parsed.to) target = peer;
+            }
+          }
+          if (target && target !== ws && target.readyState === WebSocket.OPEN) {
+            target.send(JSON.stringify({ ...parsed, from: ws.peerId }));
             delivered = true;
           }
         }
